@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PSC Exam Vault</title>
+<meta name="theme-color" content="#12151F">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <div class="topbar">
+    <div class="wordmark"><span class="mark">◷</span><h1>PSC Exam Vault</h1></div>
+    <div class="actions">
+      <button class="iconbtn" id="btnViewMode" title="Toggle scroll/swipe view">Scroll</button>
+      <button class="iconbtn" id="btnData">Data</button>
+      <button class="iconbtn primary" id="btnAdd">+ Add</button>
+    </div>
+  </div>
+
+  <div class="syllabus-bar">
+    <button class="syllabus-btn" id="syllabusBtn">📚 <span id="syllabusBtnLabel">Default</span> — change</button>
+  </div>
+
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="papers">Papers</button>
+    <button class="tab" data-tab="subjects">Subjects</button>
+    <button class="tab" data-tab="topics">Topics</button>
+    <button class="tab" data-tab="bank">Bank</button>
+    <button class="tab" data-tab="attempts">Attempts</button>
+    <button class="tab" data-tab="stats">Stats</button>
+  </div>
+
+  <main id="main"></main>
+
+</div>
+
+<div id="modalRoot"></div>
+
+<script src="taxonomy.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

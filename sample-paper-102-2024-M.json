@@ -1,0 +1,45 @@
+{
+  "paper": { "id": "kpsc-102-2024-m", "name": "102/2024-M" },
+  "questions": [
+    {
+      "id": "q1",
+      "question_text": "Consider the following statements. Which of the following is not associated with Lord Ripon? (i) Repeal of the Vernacular Press Act. (ii) The Second Afghan war. (iii) The First Factory Act of 1881. (iv) The Arms Act of 1878.",
+      "options": ["Only (i) and (ii)", "Only (iii) and (iv)", "Only (i) and (iii)", "Only (ii) and (iv)"],
+      "correct_answer_index": null,
+      "subject": "History",
+      "topic": "Modern Indian History"
+    },
+    {
+      "id": "q5",
+      "question_text": "Where is Kuno National Park located?",
+      "options": ["Maharashtra", "Madhya Pradesh", "Rajasthan", "Karnataka"],
+      "correct_answer_index": 1,
+      "subject": "Geography",
+      "topic": "Indian Geography"
+    },
+    {
+      "id": "q39",
+      "question_text": "What is the unit of force?",
+      "options": ["Newton", "Joule", "Pascal", "Watt"],
+      "correct_answer_index": 0,
+      "subject": "Physics",
+      "topic": "Work, Energy & Power"
+    },
+    {
+      "id": "q46",
+      "question_text": "Which game is associated with the term \u201cCastling\u201d?",
+      "options": ["Football", "Volleyball", "Chess", "Tennis"],
+      "correct_answer_index": 2,
+      "subject": "Arts, Literature, Culture, Sports",
+      "topic": "Other"
+    },
+    {
+      "id": "q100",
+      "question_text": "What is the hexadecimal representation of 15?",
+      "options": ["A", "C", "D", "F"],
+      "correct_answer_index": 3,
+      "subject": "Basics of Computer",
+      "topic": "Other"
+    }
+  ]
+}

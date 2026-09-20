@@ -1,0 +1,15 @@
+{
+  "id": "psc-exam-vault-app",
+  "name": "PSC Exam Vault",
+  "short_name": "Exam Vault",
+  "description": "Timed/untimed practice tests, syllabuses, question banks, and marking-scheme scoring for Kerala PSC papers.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#12151F",
+  "theme_color": "#12151F",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icon.svg", "sizes": "192x192 512x512", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
