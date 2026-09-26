@@ -41,15 +41,24 @@ Rules:
    rather than guessing or leaving it null.
 5. Do NOT generate questions in Hindi, Kannada, or Tamil — skip any
    questions in those languages entirely if the paper contains them.
-6. For math or scientific notation, use plain Unicode symbols (÷ × √ ± ≤ ≥ π)
-   or spell it out in words — never LaTeX-style backslash commands like
-   \div, \times, or \sqrt. A raw backslash is a special character in JSON
-   and commands like these will break the file.
-7. Only include "explanation" when you have a reliable source for why an
+6. For simple math or scientific notation, prefer plain Unicode symbols
+   (÷ × √ ± ≤ ≥ π) or words. For anything that must be properly stacked or
+   multi-line — fractions, exponents, roots with a bar over long
+   expressions, multi-line algebraic expressions — wrap it in LaTeX between
+   single dollar signs, e.g. $\frac{x+3}{7} = \frac{2x+1}{9}$ or
+   $\frac{54\times54\times54+3\times54\times54\times46}{54\times54-46\times46}$.
+   The app renders this properly. Escape every backslash as \\\\ so the
+   JSON string stays valid (e.g. write "\\\\frac" not "\\frac" — the file
+   itself must contain two backslashes for every one you intend to show).
+7. You may use **double asterisks** around a phrase to highlight it (e.g.
+   a key term the question is testing), and *single asterisks* for italic
+   emphasis. Use sparingly and only where the original paper itself
+   emphasizes something — don't add emphasis that wasn't there.
+8. Only include "explanation" when you have a reliable source for why an
    answer is correct (e.g. a solutions PDF provided alongside the paper).
    Never invent or guess an explanation — omit the field entirely rather
    than fabricate one.
-8. Assign "subject" using ONLY this fixed list — do not invent new subjects:
+9. Assign "subject" using ONLY this fixed list — do not invent new subjects:
    History, Geography, Economics, Indian Constitution,
    Kerala Governance & Administration, Life Science, Physics, Chemistry,
    Arts, Literature, Culture, Sports, Basics of Computer,
@@ -57,7 +66,7 @@ Rules:
    Current Affairs, Simple Arithmetic, Mental Ability & Reasoning,
    General English, Malayalam
 
-9. Assign "topic" using ONLY the fixed topic list under the matching
+10. Assign "topic" using ONLY the fixed topic list under the matching
    subject below. If a question genuinely does not fit any listed topic
    for its subject, set "topic" to "Other".
 
@@ -184,8 +193,8 @@ Rules:
 
    Every subject also allows "Other" if nothing above fits.
 
-10. Output ONLY the raw JSON, no explanation, no markdown code fences.
-11. If a question is a "match the following" or multi-statement type, keep
+11. Output ONLY the raw JSON, no explanation, no markdown code fences.
+12. If a question is a "match the following" or multi-statement type, keep
    the full statement/matching text inside question_text exactly as
    printed — do not restructure it into a different format.
 ```

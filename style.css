@@ -20,6 +20,7 @@
   --radius-paper: 3px;
   --radius-pill: 999px;
   --shadow-stack: 0 1px 0 #00000030, 0 6px 14px -8px #00000060;
+  --topbar-h: 58px;
   font-size: 16px;
 }
 
@@ -45,9 +46,10 @@ button, input, select, textarea{font-family:inherit;}
 
 .topbar{
   position:sticky;top:0;z-index:10;
+  height:var(--topbar-h);box-sizing:border-box;
   background:var(--ink-bg);
   border-bottom:1px solid var(--line);
-  padding:14px 16px 12px;
+  padding:0 16px;
   display:flex;align-items:center;justify-content:space-between;
   gap:12px;
 }
@@ -160,6 +162,9 @@ main{flex:1;padding:14px 16px 90px;}
 .summary-stat .num.bad{color:#f0a3ab;}
 .summary-stat .num.neutral{color:var(--text-dim-on-ink);}
 .summary-stat .label{font-size:0.72rem;color:var(--text-dim-on-ink);margin-top:2px;}
+.summary-stat.clickable{background:none;border:1px solid transparent;border-radius:8px;cursor:pointer;font-family:inherit;}
+.summary-stat.clickable:active{background:var(--ink-bg);}
+.summary-stat.clickable.active{border-color:var(--gold);background:var(--ink-bg);}
 
 /* ---- Question slip ---- */
 .slip{
@@ -208,6 +213,7 @@ main{flex:1;padding:14px 16px 90px;}
 .pill.topic{background:#dcece5;color:var(--teal);cursor:pointer;}
 .pill.paper{background:var(--paper-dim);color:var(--text-dim-on-paper);border-color:var(--line-on-paper);}
 .pill.post{background:#dde6f5;color:#2f4f7a;}
+.pill.time-pill{background:#eee0c7;color:#7a5a1e;}
 .pill.syllabus{background:#eadcf5;color:#5a3a7a;}
 
 .actbtn{
@@ -218,6 +224,8 @@ main{flex:1;padding:14px 16px 90px;}
 .actbtn:active{background:var(--gold);}
 .actbtn.danger{color:var(--maroon);}
 .actbtn.bank-remove{color:var(--maroon);font-size:0.78rem;font-weight:600;min-width:auto;padding:6px 12px;}
+.actbtn.flagged{background:#fbeecb;border-color:var(--gold);}
+.hltext{background:#f6dc9a;color:var(--text-on-paper);padding:0 2px;border-radius:3px;}
 
 .opthint{font-size:0.74rem;color:var(--text-dim-on-paper);margin-top:8px;}
 
@@ -279,14 +287,18 @@ main{flex:1;padding:14px 16px 90px;}
 .check-item.checked .box{background:var(--gold);border-color:var(--gold);color:#1B1305;}
 .check-item .ci-sub{font-size:0.76rem;color:var(--text-dim-on-ink);}
 
-/* ---- Timer ---- */
-.timer-bar{
-  display:flex;align-items:center;justify-content:center;gap:8px;
+/* ---- Test toolbar (timer/progress + pause + submit) — sticky at top ---- */
+.test-toolbar{
+  position:sticky; top:var(--topbar-h); z-index:8;
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
   background:var(--ink-bg-raised);border:1px solid var(--line);border-radius:10px;
-  padding:10px;margin:10px 0;
+  padding:10px 12px;margin:10px 0;
 }
-.timer-bar .timer-num{font-family:"Fraunces",serif;font-size:1.3rem;color:var(--gold);}
-.timer-bar.low .timer-num{color:var(--bad);}
+.test-toolbar-left{display:flex;align-items:center;gap:10px;}
+.test-toolbar .timer-num{font-family:"Fraunces",serif;font-size:1.3rem;color:var(--gold);}
+.test-toolbar.low .timer-num{color:var(--bad);}
+.test-toolbar.paused{border-color:var(--gold-dim);}
+.test-toolbar.paused .timer-num{color:var(--text-dim-on-ink);}
 .stepper{display:flex;align-items:center;gap:10px;justify-content:center;margin:10px 0;}
 .stepper.left{justify-content:flex-start;}
 .stepper button{
@@ -312,15 +324,13 @@ main{flex:1;padding:14px 16px 90px;}
   width:70px;padding:8px;border-radius:6px;border:1px solid var(--line);
   background:var(--ink-bg);color:var(--text-on-ink);
 }
-.swipe-nav{
-  display:flex;align-items:center;justify-content:space-between;gap:10px;
-  margin:10px 0;
-}
-.swipe-nav .iconbtn{flex:0 0 auto;}
-.swipe-nav .progress{flex:1;text-align:center;font-size:0.82rem;color:var(--text-dim-on-ink);}
 .swipe-touch-area{touch-action:pan-y;}
+/* Question-number jump bar: sticks below the topbar once scrolled content
+   above it (intro text, action buttons) has passed out of view. */
 .qnum-bar{
+  position:sticky; top:var(--topbar-h); z-index:7;
   display:flex;gap:6px;overflow-x:auto;padding:8px 2px;margin-bottom:6px;
+  background:var(--ink-bg);
   scrollbar-width:none;
 }
 .qnum-bar::-webkit-scrollbar{display:none;}

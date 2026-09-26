@@ -15,6 +15,9 @@ function loadData(){
   if(!Array.isArray(parsed.attempts)) parsed.attempts = [];
   if(!Array.isArray(parsed.banks)) parsed.banks = [];
   if(!Array.isArray(parsed.paperTemplates)) parsed.paperTemplates = [];
+  if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
+  migrateStudyProgress(parsed.studyProgress);
+  if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};
   if(!Array.isArray(parsed.syllabuses) || parsed.syllabuses.length===0){
     parsed.syllabuses = [{ id:"default", name:"Default", marking: Object.assign({}, DEFAULT_MARKING) }];
   }
@@ -29,6 +32,15 @@ function loadData(){
   });
   parsed.attempts.forEach(a=>{ if(!a.syllabus_id) a.syllabus_id = "default"; });
   return parsed;
+}
+function migrateStudyProgress(sp){
+  // Legacy schema stored a plain number per key; upgrade to {count, lastStudiedAt, nextReviewAt}
+  Object.keys(sp).forEach(k=>{
+    if(typeof sp[k] === "number"){
+      const count = sp[k];
+      sp[k] = { count, lastStudiedAt: null, nextReviewAt: null };
+    }
+  });
 }
 function saveData(data){
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
@@ -61,24 +73,84 @@ function computeNetScore(correctCount, wrongCount, marking){
   return Math.round((correctCount*pos - deduction) * 100) / 100;
 }
 
-/* ---- Study-progress tracker (per syllabus, per subject+topic) ---- */
+/* ---- Study-progress tracker with spaced repetition (per syllabus, per subject+topic) ---- */
+const REVIEW_INTERVALS_DAYS = [1, 2, 4, 7, 14, 30, 60];
 function studyProgressKey(subject, topic){
   return `${getCurrentSyllabusId()}::${subject}|||${topic}`;
 }
-function getStudyCount(subject, topic){
-  return (DATA.studyProgress && DATA.studyProgress[studyProgressKey(subject,topic)]) || 0;
+function getStudyInfo(subject, topic){
+  const raw = DATA.studyProgress && DATA.studyProgress[studyProgressKey(subject,topic)];
+  const info = raw ? Object.assign({count:0,lastStudiedAt:null,nextReviewAt:null}, raw) : {count:0,lastStudiedAt:null,nextReviewAt:null};
+  info.isDue = info.nextReviewAt !== null && Date.now() >= info.nextReviewAt;
+  return info;
 }
+function getStudyCount(subject, topic){ return getStudyInfo(subject, topic).count; }
 function incrementStudyCount(subject, topic){
   if(!DATA.studyProgress) DATA.studyProgress = {};
   const k = studyProgressKey(subject,topic);
-  DATA.studyProgress[k] = (DATA.studyProgress[k]||0) + 1;
+  const cur = DATA.studyProgress[k] || {count:0,lastStudiedAt:null,nextReviewAt:null};
+  cur.count = (cur.count||0) + 1;
+  cur.lastStudiedAt = Date.now();
+  const interval = REVIEW_INTERVALS_DAYS[Math.min(cur.count-1, REVIEW_INTERVALS_DAYS.length-1)];
+  cur.nextReviewAt = cur.lastStudiedAt + interval*86400000;
+  DATA.studyProgress[k] = cur;
   saveData(DATA);
+  recordActivity();
 }
 function decrementStudyCount(subject, topic){
   if(!DATA.studyProgress) DATA.studyProgress = {};
   const k = studyProgressKey(subject,topic);
-  DATA.studyProgress[k] = Math.max(0, (DATA.studyProgress[k]||0) - 1);
+  const cur = DATA.studyProgress[k] || {count:0,lastStudiedAt:null,nextReviewAt:null};
+  cur.count = Math.max(0, (cur.count||0) - 1);
+  if(cur.count===0){
+    cur.lastStudiedAt = null; cur.nextReviewAt = null;
+  } else if(cur.lastStudiedAt){
+    const interval = REVIEW_INTERVALS_DAYS[Math.min(cur.count-1, REVIEW_INTERVALS_DAYS.length-1)];
+    cur.nextReviewAt = cur.lastStudiedAt + interval*86400000;
+  }
+  DATA.studyProgress[k] = cur;
   saveData(DATA);
+}
+function dueForReviewList(){
+  const cur = getCurrentSyllabusId();
+  const prefix = cur + "::";
+  const out = [];
+  Object.keys(DATA.studyProgress||{}).forEach(k=>{
+    if(!k.startsWith(prefix)) return;
+    const rest = k.slice(prefix.length);
+    const sep = rest.indexOf("|||");
+    if(sep<0) return;
+    const subject = rest.slice(0,sep), topic = rest.slice(sep+3);
+    const info = getStudyInfo(subject, topic);
+    if(info.isDue) out.push({ subject, topic, info });
+  });
+  out.sort((a,b)=> (a.info.nextReviewAt||0) - (b.info.nextReviewAt||0));
+  return out;
+}
+function countTopicAttempts(subject, topic){
+  const key = `${subject}|||${topic}`;
+  const cur = getCurrentSyllabusId();
+  return (DATA.attempts||[]).filter(a=> a.type==="topic" && a.scopeKey===key && a.syllabus_id===cur).length;
+}
+
+/* ---- Daily activity streak ---- */
+function todayKey(){ return new Date().toISOString().slice(0,10); }
+function recordActivity(){
+  if(!DATA.dailyActivity) DATA.dailyActivity = {};
+  const k = todayKey();
+  DATA.dailyActivity[k] = (DATA.dailyActivity[k]||0) + 1;
+  saveData(DATA);
+}
+function computeStreak(){
+  if(!DATA.dailyActivity) return { streak:0, today:0 };
+  let streak = 0;
+  const d = new Date();
+  for(;;){
+    const k = d.toISOString().slice(0,10);
+    if((DATA.dailyActivity[k]||0) > 0){ streak++; d.setDate(d.getDate()-1); }
+    else break;
+  }
+  return { streak, today: DATA.dailyActivity[todayKey()]||0 };
 }
 
 /* ================= Taxonomy state (mutable — supports renaming) ================= */
@@ -221,6 +293,29 @@ function escapeHtml(str){
     .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
     .replace(/"/g,"&quot;");
 }
+/* Rich text: escapes HTML first (safe), then applies limited markdown
+   (**highlight**, *italic*) and leaves $...$ / $$...$$ math delimiters
+   intact for KaTeX to typeset afterwards. white-space:pre-wrap in CSS
+   preserves line breaks and spacing exactly as typed/pasted. */
+function renderRichText(str){
+  let s = escapeHtml(str);
+  s = s.replace(/\*\*(.+?)\*\*/g, '<mark class="hltext">$1</mark>');
+  s = s.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  return s;
+}
+function typesetMath(container){
+  if(window.renderMathInElement){
+    try{
+      window.renderMathInElement(container, {
+        delimiters: [
+          {left:"$$", right:"$$", display:true},
+          {left:"$", right:"$", display:false}
+        ],
+        throwOnError: false
+      });
+    }catch(e){ /* KaTeX not ready or bad input — fail silently, plain text still shows */ }
+  }
+}
 function toast(msg){
   const t = document.createElement("div");
   t.className="toast";
@@ -299,6 +394,7 @@ document.getElementById("btnViewMode").addEventListener("click", ()=>{
   render();
 });
 document.getElementById("syllabusBtn").addEventListener("click", openSyllabusModal);
+document.getElementById("btnSearch").addEventListener("click", openGlobalSearchModal);
 
 function render(){
   if(timerIntervalId){ clearInterval(timerIntervalId); timerIntervalId = null; }
@@ -314,6 +410,8 @@ function render(){
     case "bank": renderBankRoot(); break;
     case "attempts": renderAttemptsRoot(); break;
     case "stats": renderStatsScreen(); break;
+    case "stats-subject": renderStatsSubject(screen.subject); break;
+    case "flagged-list": renderFlaggedList(); break;
     case "paper-detail": renderPaperDetail(screen.paperId); break;
     case "subject-topics": renderSubjectTopicsList(screen.subject); break;
     case "subject-all": renderSubjectAllQuestions(screen.subject); break;
@@ -324,6 +422,28 @@ function render(){
     case "attempt-review": renderAttemptReviewScreen(screen.attemptId); break;
     default: renderPapersList();
   }
+  updateTopbarVisibility();
+  typesetMath(mainEl);
+}
+const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","practice","attempt-review"]);
+function updateTopbarVisibility(){
+  const screen = currentScreen();
+  const isRoot = navStack.length===1;
+  const inActiveTest = screen.type==="practice" && !screen.submitted;
+  const btnData = document.getElementById("btnData");
+  const btnAdd = document.getElementById("btnAdd");
+  const btnViewMode = document.getElementById("btnViewMode");
+  const btnSearch = document.getElementById("btnSearch");
+  const tabs = document.getElementById("tabs");
+  const syllabusBar = document.querySelector(".syllabus-bar");
+  if(btnData) btnData.style.display = isRoot ? "" : "none";
+  if(btnAdd) btnAdd.style.display = isRoot ? "" : "none";
+  if(btnSearch) btnSearch.style.display = isRoot ? "" : "none";
+  if(btnViewMode) btnViewMode.style.display = (QUESTION_LIST_SCREENS.has(screen.type) && !inActiveTest) ? "" : "none";
+  // While an exam is actively being taken, hide navigation that could distract
+  // or lead someone away from the test (syllabus switch, tab bar).
+  if(tabs) tabs.style.display = inActiveTest ? "none" : "";
+  if(syllabusBar) syllabusBar.style.display = inActiveTest ? "none" : "";
 }
 function updateTabHighlight(){
   const rootType = navStack[0] ? navStack[0].type : "papers";
@@ -442,10 +562,14 @@ function renderTopicsList(){
     .filter(e=>e.topic.toLowerCase().includes(searchTerm.toLowerCase()) || e.subject.toLowerCase().includes(searchTerm.toLowerCase()))
     .forEach((e, idx)=>{
       const studied = getStudyCount(e.subject, e.topic);
+      const attempts = countTopicAttempts(e.subject, e.topic);
+      const bits = [e.subject];
+      if(studied) bits.push(`📖 ${studied}×`);
+      if(attempts) bits.push(`📝 ${attempts} test${attempts===1?"":"s"}`);
       html += rowHtml({
         num: String(idx+1).padStart(2,"0"),
         title: e.topic,
-        sub: `${e.subject}${studied?` · 📖 studied ${studied}×`:""}`,
+        sub: bits.join(" · "),
         count: `${e.count} q`,
         dataAttr: `data-subject="${escapeHtml(e.subject)}" data-topic="${escapeHtml(e.topic)}"`
       });
@@ -504,10 +628,14 @@ function renderSubjectTopicsList(subject){
       .filter(e=>e.topic.toLowerCase().includes(searchTerm.toLowerCase()))
       .forEach((e, idx)=>{
         const studied = getStudyCount(subject, e.topic);
+        const attempts = countTopicAttempts(subject, e.topic);
+        const bits = [];
+        if(studied) bits.push(`📖 ${studied}×`);
+        if(attempts) bits.push(`📝 ${attempts} test${attempts===1?"":"s"}`);
         html += rowHtml({
           num: String(idx+1).padStart(2,"0"),
           title: e.topic,
-          sub: studied ? `📖 studied ${studied}×` : subject,
+          sub: bits.length ? bits.join(" · ") : subject,
           count: `${e.count} q`,
           dataAttr: `data-topic="${escapeHtml(e.topic)}"`
         });
@@ -543,11 +671,6 @@ function renderQuestionsListHtml(questions, screen, slipFn, isAnsweredFn){
     });
     numBar += `</div>`;
     let html = numBar;
-    html += `<div class="swipe-nav">
-      <button class="iconbtn" id="swipePrev" ${idx<=0?"disabled":""}>‹ Prev</button>
-      <div class="progress">${idx+1} of ${questions.length}</div>
-      <button class="iconbtn" id="swipeNext" ${idx>=questions.length-1?"disabled":""}>Next ›</button>
-    </div>`;
     html += `<div class="swipe-touch-area" id="swipeArea">${slipFn(questions[idx], idx+1)}</div>`;
     return html;
   }
@@ -555,10 +678,6 @@ function renderQuestionsListHtml(questions, screen, slipFn, isAnsweredFn){
 }
 function bindSwipeNav(questions, screen){
   if(getViewMode()!=="swipe") return;
-  const prevBtn = document.getElementById("swipePrev");
-  const nextBtn = document.getElementById("swipeNext");
-  if(prevBtn) prevBtn.addEventListener("click", ()=>{ if((screen.qIndex||0)>0){ screen.qIndex=(screen.qIndex||0)-1; render(); } });
-  if(nextBtn) nextBtn.addEventListener("click", ()=>{ if((screen.qIndex||0) < questions.length-1){ screen.qIndex=(screen.qIndex||0)+1; render(); } });
   document.querySelectorAll(".qnum-btn").forEach(btn=>{
     btn.addEventListener("click", ()=>{ screen.qIndex = Number(btn.dataset.qnum); render(); });
   });
@@ -582,6 +701,19 @@ function bindSwipeNav(questions, screen){
       }
     }, {passive:true});
   }
+
+  // Fixed, non-scrolling Prev/Next bar at the bottom of the screen
+  const idx = screen.qIndex||0;
+  const navBar = document.createElement("div");
+  navBar.className = "bottomnav";
+  navBar.innerHTML = `<div class="bottomnav-inner" style="justify-content:center;gap:16px;">
+    <button class="iconbtn" id="swipePrevFixed" ${idx<=0?"disabled":""}>‹ Prev</button>
+    <div class="progress">${idx+1} of ${questions.length}</div>
+    <button class="iconbtn" id="swipeNextFixed" ${idx>=questions.length-1?"disabled":""}>Next ›</button>
+  </div>`;
+  document.body.appendChild(navBar);
+  document.getElementById("swipePrevFixed").addEventListener("click", ()=>{ if((screen.qIndex||0)>0){ screen.qIndex=(screen.qIndex||0)-1; render(); } });
+  document.getElementById("swipeNextFixed").addEventListener("click", ()=>{ if((screen.qIndex||0) < questions.length-1){ screen.qIndex=(screen.qIndex||0)+1; render(); } });
 }
 
 /* ================= View-mode question-list screen (paper/subject-all/topic/bank) ================= */
@@ -753,11 +885,15 @@ function renderTopicDetail(subject, topic){
   }
 
   const studyCount = getStudyCount(subject, topic);
+  const attemptCount = countTopicAttempts(subject, topic);
   const actionsHtml = `<div class="stepper left" id="studyStepper">
     <span class="study-label">📖 Studied</span>
     <button id="studyMinus" ${studyCount<=0?"disabled":""}>−1</button>
     <div class="val">${studyCount}×</div>
     <button id="studyPlus">+1</button>
+  </div>
+  <div style="display:flex;gap:8px;margin:8px 0 4px;">
+    <button class="iconbtn" id="viewTopicAttemptsBtn" style="flex:1;justify-content:center;" ${attemptCount===0?"disabled":""}>📝 ${attemptCount} test${attemptCount===1?"":"s"} attempted from this topic</button>
   </div>
   <div style="display:flex;gap:8px;margin:12px 0 4px;">
     <button class="iconbtn" id="renameTopicBtn" style="flex:1;justify-content:center;">Rename topic</button>
@@ -779,6 +915,10 @@ function renderTopicDetail(subject, topic){
     bindActions: ()=>{
       document.getElementById("studyMinus").addEventListener("click", ()=>{ decrementStudyCount(subject, topic); render(); });
       document.getElementById("studyPlus").addEventListener("click", ()=>{ incrementStudyCount(subject, topic); render(); });
+      const viewAttemptsBtn = document.getElementById("viewTopicAttemptsBtn");
+      if(attemptCount>0){
+        viewAttemptsBtn.addEventListener("click", ()=> pushScreen({ type:"attempts-for-scope", groupBy:"topic", scopeKey:`${subject}|||${topic}`, scopeLabel:`${subject} — ${topic}` }));
+      }
       document.getElementById("renameTopicBtn").addEventListener("click", ()=> openRenameTopicModal(subject, topic));
       document.getElementById("copyListBtn").addEventListener("click", ()=> copyQuestionsToClipboard(questions, `${subject} — ${topic}`));
       document.getElementById("filterPapersBtn").addEventListener("click", ()=>{
@@ -795,6 +935,7 @@ function renderTopicDetail(subject, topic){
 function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
   const isDeleted = Number(q.correct_answer_index) === DELETED_SENTINEL;
   const originalNum = questionOriginalNumber(q);
+  const flagged = !!q.flagged;
 
   const opts = (q.options||[]).map((opt, i)=>{
     const isCorrect = !isDeleted && q.correct_answer_index !== null && q.correct_answer_index !== undefined && Number(q.correct_answer_index) === i;
@@ -802,7 +943,7 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
     const disabled = isDeleted || hideAnswers || locked;
     return `<li class="${showCorrect?"correct":""}">
       <button type="button" class="optlabel-btn ${showCorrect?"correct":""}" data-idx="${i}" ${disabled?"disabled":""}>${letterFor(i)}</button>
-      <span class="opttext">${escapeHtml(opt)}</span>
+      <span class="opttext">${renderRichText(opt)}</span>
     </li>`;
   }).join("");
 
@@ -813,7 +954,7 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
 
   let expl = "";
   if(showExplanations && q.explanation && q.explanation.trim()){
-    expl = `<div class="explanation-block"><div class="exp-label">Explanation</div>${escapeHtml(q.explanation)}</div>`;
+    expl = `<div class="explanation-block"><div class="exp-label">Explanation</div>${renderRichText(q.explanation)}</div>`;
   }
 
   return `<div class="slip ${isDeleted?"slip-deleted":""}" data-qid="${escapeHtml(q._paperId)}::${escapeHtml(q.id)}">
@@ -828,6 +969,7 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
     </div>
     <div class="actions-row">
       <div class="grp">
+        <button class="actbtn ${flagged?"flagged":""}" data-action="toggle-flag" title="Flag for review">${flagged?"⭐":"☆"}</button>
         <button class="actbtn" data-action="copy-question" title="Copy this question">📋</button>
         <button class="actbtn" data-action="edit-question" title="Edit question">📝</button>
       </div>
@@ -837,7 +979,7 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
       </div>
     </div>
     ${isDeleted ? `<div class="deleted-banner">Deleted question (per official PSC answer key)</div>` : ""}
-    <div class="qtext">${escapeHtml(q.question_text)}</div>
+    <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options">${opts}</ul>
     ${expl}
     ${hint ? `<div class="opthint">${hint}</div>` : ""}
@@ -871,6 +1013,16 @@ function bindSlipInteractions(questions){
         render();
         toast("Question deleted");
       }
+    });
+  });
+  document.querySelectorAll('.actbtn[data-action="toggle-flag"]').forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const slip = e.target.closest(".slip");
+      const [paperId, qid] = slip.dataset.qid.split("::");
+      const nowFlagged = toggleFlag(paperId, qid);
+      render();
+      toast(nowFlagged ? "Flagged for review" : "Flag removed");
     });
   });
   document.querySelectorAll('.actbtn[data-action="toggle-deleted"]').forEach(btn=>{
@@ -945,6 +1097,18 @@ function deleteQuestion(paperId, qid){
   if(!paper) return;
   paper.questions = (paper.questions||[]).filter(qq=>String(qq.id)!==qid);
   saveData(DATA);
+}
+function toggleFlag(paperId, qid){
+  const paper = DATA.papers.find(p=>p.id===paperId);
+  if(!paper) return false;
+  const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
+  if(!q) return false;
+  q.flagged = !q.flagged;
+  saveData(DATA);
+  return q.flagged;
+}
+function collectFlaggedQuestions(){
+  return visibleQuestions().filter(q=>q.flagged);
 }
 
 /* ================= Edit question modal ================= */
@@ -1341,7 +1505,7 @@ function practiceSlipHtml(q, idx, selectedIndex){
     const isSelected = selectedIndex!==null && selectedIndex!==undefined && Number(selectedIndex)===i;
     return `<li class="${isSelected?"selected":""}" data-idx="${i}">
       <span class="optlabel-btn">${letterFor(i)}</span>
-      <span class="opttext">${escapeHtml(opt)}</span>
+      <span class="opttext">${renderRichText(opt)}</span>
     </li>`;
   }).join("");
   return `<div class="slip" data-qid="${escapeHtml(q._paperId)}::${escapeHtml(q.id)}">
@@ -1354,7 +1518,7 @@ function practiceSlipHtml(q, idx, selectedIndex){
         <span class="pill topic">${escapeHtml(q.topic||FALLBACK_TOPIC)}</span>
       </div>
     </div>
-    <div class="qtext">${escapeHtml(q.question_text)}</div>
+    <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options practice">${opts}</ul>
   </div>`;
 }
@@ -1397,7 +1561,17 @@ function computeAttemptResults(questionRefs, answers){
 }
 
 function submitPracticeTest(screen, autoSubmitted){
+  const idxMap = buildQuestionIndex();
+  const orderedQuestions = screen.questionRefs.map(ref=> idxMap[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
+  flushCurrentQuestionTime(screen, orderedQuestions);
+
   const results = computeAttemptResults(screen.questionRefs, screen.answers);
+  if(screen.timeSpent){
+    results.answerRecords.forEach(rec=>{
+      const key = `${rec.paperId}::${rec.qid}`;
+      if(screen.timeSpent[key]) rec.timeMs = screen.timeSpent[key];
+    });
+  }
   const marking = getSyllabusById(screen.syllabusId||"default").marking;
   const netScore = computeNetScore(results.correctCount, results.wrongCount, marking);
   const attempt = {
@@ -1420,22 +1594,48 @@ function submitPracticeTest(screen, autoSubmitted){
   if(!DATA.attempts) DATA.attempts = [];
   DATA.attempts.push(attempt);
   saveData(DATA);
+  recordActivity();
   screen.submitted = true;
   screen.results = results;
   screen.netScore = netScore;
   screen.marking = marking;
   screen.attemptId = attempt.id;
   screen.qIndex = 0;
+  screen.reviewFilter = "all";
   render();
   toast(autoSubmitted
     ? `Time's up — submitted: ${results.correctCount} correct, ${results.wrongCount} wrong`
     : `Submitted: ${results.correctCount} correct, ${results.wrongCount} wrong`);
 }
+function flushCurrentQuestionTime(screen, questions){
+  if(screen._qStartedAt===undefined) return;
+  const i = screen._lastIndex!==undefined ? screen._lastIndex : (screen.qIndex||0);
+  const q = questions[i];
+  if(!q) return;
+  const key = `${q._paperId}::${q.id}`;
+  if(!screen.timeSpent) screen.timeSpent = {};
+  screen.timeSpent[key] = (screen.timeSpent[key]||0) + (Date.now() - screen._qStartedAt);
+  screen._qStartedAt = Date.now();
+}
+
+function togglePause(screen){
+  if(!screen.timerEndAt) return;
+  if(screen.paused){
+    const pausedDuration = Date.now() - screen.pausedAt;
+    screen.timerEndAt += pausedDuration;
+    screen.paused = false;
+    screen.pausedAt = null;
+  } else {
+    screen.paused = true;
+    screen.pausedAt = Date.now();
+  }
+  render();
+}
 
 function startPracticeTimerTick(screen){
   function tick(){
     const el = document.getElementById("timerNum");
-    const bar = document.getElementById("timerBar");
+    const bar = document.getElementById("testToolbar");
     if(!el || !bar) return;
     const remainingMs = screen.timerEndAt - Date.now();
     if(remainingMs<=0){
@@ -1455,11 +1655,22 @@ function startPracticeTimerTick(screen){
 }
 
 function renderPracticeScreen(screen){
-  const idx = buildQuestionIndex();
-  const questions = screen.questionRefs.map(ref=> idx[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
+  const idxMap = buildQuestionIndex();
+  const questions = screen.questionRefs.map(ref=> idxMap[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
 
   if(!screen.submitted){
     const answeredCount = Object.keys(screen.answers).length;
+
+    // Per-question timing bookkeeping (best-effort, meaningful mainly in swipe view)
+    const nowTs = Date.now();
+    if(!screen.paused){
+      if(screen._qStartedAt===undefined){ screen._qStartedAt = nowTs; screen._lastIndex = screen.qIndex||0; }
+      else if(screen._lastIndex !== (screen.qIndex||0)){
+        flushCurrentQuestionTime(screen, questions);
+        screen._lastIndex = screen.qIndex||0;
+      }
+    }
+
     let html = `<div class="detail-head">
       <div style="width:100%">
         <div class="backrow" id="backBtn">‹ Exit practice test</div>
@@ -1475,9 +1686,13 @@ function renderPracticeScreen(screen){
       return;
     }
 
-    if(screen.timerEndAt){
-      html += `<div class="timer-bar" id="timerBar"><span>⏱</span><span class="timer-num" id="timerNum">--:--</span></div>`;
-    }
+    html += `<div class="test-toolbar ${screen.paused?"paused":""}" id="testToolbar">
+      <div class="test-toolbar-left">
+        ${screen.timerEndAt ? `<button class="iconbtn" id="pauseBtn" title="${screen.paused?"Resume":"Pause"}">${screen.paused?"▶":"⏸"}</button><span class="timer-num" id="timerNum">${screen.paused?"PAUSED":"--:--"}</span>`
+          : `<span class="progress">Answered ${answeredCount} of ${questions.length}</span>`}
+      </div>
+      <button class="iconbtn primary" id="submitTestBtn">Submit</button>
+    </div>`;
 
     html += renderQuestionsListHtml(questions, screen, (q,i)=> practiceSlipHtml(q, i, screen.answers[`${q._paperId}::${q.id}`]), (q)=> screen.answers[`${q._paperId}::${q.id}`]!==undefined);
     mainEl.innerHTML = html;
@@ -1487,15 +1702,9 @@ function renderPracticeScreen(screen){
     });
     bindSwipeNav(questions, screen);
     bindPracticeInteractions(screen);
-    if(screen.timerEndAt) startPracticeTimerTick(screen);
-
-    const bar = document.createElement("div");
-    bar.className = "bottomnav";
-    bar.innerHTML = `<div class="bottomnav-inner">
-      <div class="progress">Answered ${answeredCount} of ${questions.length}</div>
-      <button class="iconbtn primary" id="submitTestBtn">Submit test</button>
-    </div>`;
-    document.body.appendChild(bar);
+    const pauseBtn = document.getElementById("pauseBtn");
+    if(pauseBtn) pauseBtn.addEventListener("click", ()=> togglePause(screen));
+    if(screen.timerEndAt && !screen.paused) startPracticeTimerTick(screen);
     document.getElementById("submitTestBtn").addEventListener("click", ()=>{
       if(answeredCount < questions.length && !confirm(`You've answered ${answeredCount} of ${questions.length}. Submit anyway?`)) return;
       submitPracticeTest(screen, false);
@@ -1517,12 +1726,14 @@ function renderPracticeScreen(screen){
       bindExtra: ()=>{
         document.getElementById("retakeBtn").addEventListener("click", ()=>{
           screen.answers = {}; screen.submitted = false; screen.results = null; screen.qIndex = 0;
+          screen._qStartedAt = undefined; screen._lastIndex = undefined; screen.timeSpent = {};
           render();
         });
       }
     });
   }
 }
+
 
 /* ================= Results review (shared by practice results & attempt history) ================= */
 function reviewSlipHtml(q, idx, rec, showExplanations){
@@ -1533,7 +1744,7 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
     const isSelectedWrong = isGraded && rec.selectedIndex!==null && Number(rec.selectedIndex)===i && !rec.isCorrect;
     let cls = "";
     if(isCorrectOpt) cls="correct"; else if(isSelectedWrong) cls="wrong-pick";
-    return `<li class="${cls}"><span class="optlabel-btn ${cls}">${letterFor(i)}</span><span class="opttext">${escapeHtml(opt)}</span></li>`;
+    return `<li class="${cls}"><span class="optlabel-btn ${cls}">${letterFor(i)}</span><span class="opttext">${renderRichText(opt)}</span></li>`;
   }).join("");
 
   let banner;
@@ -1549,8 +1760,10 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
 
   let expl = "";
   if(showExplanations && q.explanation && q.explanation.trim()){
-    expl = `<div class="explanation-block"><div class="exp-label">Explanation</div>${escapeHtml(q.explanation)}</div>`;
+    expl = `<div class="explanation-block"><div class="exp-label">Explanation</div>${renderRichText(q.explanation)}</div>`;
   }
+
+  const timeBadge = (rec.timeMs && rec.timeMs>0) ? `<span class="pill time-pill">⏱ ${formatDuration(rec.timeMs)}</span>` : "";
 
   const slipClass = isGraded ? (rec.selectedIndex===null ? "" : (rec.isCorrect?"slip-correct":"slip-wrong")) : "";
 
@@ -1558,6 +1771,7 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
     <div class="slip-head">
       <div class="qno">Q${idx}${originalNum?` <span class="qno-orig">(Paper Q${escapeHtml(originalNum)})</span>`:""}</div>
       <div class="pills">
+        ${timeBadge}
         ${q._postName ? `<span class="pill post">${escapeHtml(q._postName)}</span>` : ""}
         <span class="pill paper">${escapeHtml(q._paperName)}</span>
         <span class="pill subject">${escapeHtml(q.subject||"Unclassified")}</span>
@@ -1565,15 +1779,22 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
       </div>
     </div>
     ${banner}
-    <div class="qtext">${escapeHtml(q.question_text)}</div>
+    <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options">${opts}</ul>
     ${expl}
   </div>`;
+}
+function formatDuration(ms){
+  const totalSec = Math.round(ms/1000);
+  if(totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec/60), s = totalSec%60;
+  return `${m}m ${s}s`;
 }
 
 function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, counts, netScore, marking, screen, extraActionsHtml, bindExtra }){
   const idxMap = buildQuestionIndex();
   const resolved = answerRecords.map(rec=>({ rec, q: idxMap[`${rec.paperId}::${rec.qid}`] })).filter(x=>x.q);
+  const filter = screen.reviewFilter || "all";
 
   let html = `<div class="detail-head">
     <div style="width:100%">
@@ -1584,13 +1805,17 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
   </div>`;
 
   html += `<div class="summary-banner">
-    <div class="summary-stat"><div class="num good">${counts.correctCount}</div><div class="label">Correct</div></div>
-    <div class="summary-stat"><div class="num bad">${counts.wrongCount}</div><div class="label">Wrong</div></div>
-    <div class="summary-stat"><div class="num neutral">${counts.unansweredCount}</div><div class="label">Unanswered</div></div>
+    <button type="button" class="summary-stat clickable ${filter==='correct'?'active':''}" data-filter="correct"><div class="num good">${counts.correctCount}</div><div class="label">Correct</div></button>
+    <button type="button" class="summary-stat clickable ${filter==='wrong'?'active':''}" data-filter="wrong"><div class="num bad">${counts.wrongCount}</div><div class="label">Wrong</div></button>
+    <button type="button" class="summary-stat clickable ${filter==='unanswered'?'active':''}" data-filter="unanswered"><div class="num neutral">${counts.unansweredCount}</div><div class="label">Unanswered</div></button>
     <div class="summary-stat"><div class="num neutral">${counts.totalCount}</div><div class="label">Total</div></div>
     ${netScore!==undefined && netScore!==null ? `<div class="summary-stat"><div class="num" style="color:var(--gold);">${netScore}</div><div class="label">Score${marking?` (+${marking.positive}/−${marking.negNum}÷${marking.negDen})`:""}</div></div>` : ""}
   </div>`;
+  if(filter!=="all"){
+    html += `<div style="margin:-4px 0 10px;"><button class="iconbtn" id="clearFilterBtn">Showing "${filter}" only — tap to show all</button></div>`;
+  }
 
+  const hasTiming = resolved.some(x=> x.rec.timeMs && x.rec.timeMs>0);
   const hasExplanations = resolved.some(x=> x.q.explanation && x.q.explanation.trim());
   let actionsHtml = extraActionsHtml || "";
   if(hasExplanations){
@@ -1598,20 +1823,38 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
       <button class="iconbtn" id="toggleExplBtn" style="flex:1;justify-content:center;">${screen.showExplanations?"Hide explanations":"Show explanations"}</button>
     </div>`;
   }
+  if(hasTiming){
+    actionsHtml += `<div class="meta" style="margin:4px 0 4px;">⏱ Time-per-question is shown on each card below (tracked in swipe view).</div>`;
+  }
   if(actionsHtml) html += actionsHtml;
 
-  const questions = resolved.map(x=>x.q);
+  let filteredResolved = resolved;
+  if(filter==="correct") filteredResolved = resolved.filter(x=> x.rec.isGraded && x.rec.isCorrect);
+  else if(filter==="wrong") filteredResolved = resolved.filter(x=> x.rec.isGraded && !x.rec.isCorrect && x.rec.selectedIndex!==null);
+  else if(filter==="unanswered") filteredResolved = resolved.filter(x=> x.rec.isGraded && x.rec.selectedIndex===null);
+
+  const questions = filteredResolved.map(x=>x.q);
   const recMap = {};
-  resolved.forEach(x=>{ recMap[`${x.q._paperId}::${x.q.id}`] = x.rec; });
+  filteredResolved.forEach(x=>{ recMap[`${x.q._paperId}::${x.q.id}`] = x.rec; });
 
   if(questions.length===0){
-    html += emptyState("No questions to show", "The questions in this attempt may have been deleted since.");
+    html += emptyState("No questions to show", filter!=="all" ? `No questions match "${filter}".` : "The questions in this attempt may have been deleted since.");
   } else {
     html += renderQuestionsListHtml(questions, screen, (q,i)=> reviewSlipHtml(q, i, recMap[`${q._paperId}::${q.id}`], !!screen.showExplanations));
   }
 
   mainEl.innerHTML = html;
   document.getElementById("backBtn").addEventListener("click", onBack);
+  document.querySelectorAll(".summary-stat[data-filter]").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      const f = btn.dataset.filter;
+      screen.reviewFilter = (screen.reviewFilter===f) ? "all" : f;
+      screen.qIndex = 0;
+      render();
+    });
+  });
+  const clearBtn = document.getElementById("clearFilterBtn");
+  if(clearBtn) clearBtn.addEventListener("click", ()=>{ screen.reviewFilter="all"; screen.qIndex=0; render(); });
   const explBtn = document.getElementById("toggleExplBtn");
   if(explBtn) explBtn.addEventListener("click", ()=>{ screen.showExplanations = !screen.showExplanations; render(); });
   if(bindExtra) bindExtra();
@@ -1918,6 +2161,8 @@ function openRandomExamModal(bank){
 function renderAttemptsRoot(){
   const screen = currentScreen();
   const grouping = screen.grouping || "paper";
+  const sortMode = screen.attemptsSort || "recent";
+  const searchTerm = getSearch();
   const cur = getCurrentSyllabusId();
   const attempts = (DATA.attempts||[]).filter(a=> a.type===grouping && (grouping==="bank" || a.syllabus_id===cur));
 
@@ -1937,28 +2182,53 @@ function renderAttemptsRoot(){
       if(!groups[a.scopeKey]) groups[a.scopeKey] = { scopeKey:a.scopeKey, scopeLabel:a.scopeLabel, attempts:[] };
       groups[a.scopeKey].attempts.push(a);
     });
-    const rows = Object.values(groups).map(g=>{
+    let rows = Object.values(groups).map(g=>{
       g.attempts.sort((x,y)=> new Date(y.timestamp)-new Date(x.timestamp));
       const latest = g.attempts[0];
       const avgPct = Math.round(100 * g.attempts.reduce((s,a)=> s + (a.totalCount? a.correctCount/a.totalCount : 0), 0) / g.attempts.length);
       return { g, latest, avgPct };
-    }).sort((a,b)=> new Date(b.latest.timestamp) - new Date(a.latest.timestamp));
-
-    html += `<div id="listWrap">`;
-    rows.forEach((r, idx)=>{
-      html += rowHtml({
-        num: String(idx+1).padStart(2,"0"),
-        title: r.g.scopeLabel,
-        sub: `${r.g.attempts.length} attempt${r.g.attempts.length===1?"":"s"} · avg ${r.avgPct}% correct`,
-        count: (r.latest.netScore!==undefined && r.latest.netScore!==null) ? `${r.latest.netScore} pts` : `${r.latest.correctCount}/${r.latest.totalCount}`,
-        dataAttr: `data-scope-key="${escapeHtml(r.g.scopeKey)}" data-scope-label="${escapeHtml(r.g.scopeLabel)}"`
-      });
     });
-    html += `</div>`;
+
+    if(searchTerm){
+      rows = rows.filter(r=> r.g.scopeLabel.toLowerCase().includes(searchTerm.toLowerCase()));
+    }
+
+    html += `<input class="search" id="searchBox" placeholder="Search by ${grouping}…" value="${escapeHtml(searchTerm)}">`;
+    html += `<div class="segmented" id="sortSeg" style="margin-top:8px;">
+      <button data-s="recent" class="${sortMode==='recent'?'active':''}">Most recent</button>
+      <button data-s="az" class="${sortMode==='az'?'active':''}">A–Z</button>
+      <button data-s="best" class="${sortMode==='best'?'active':''}">Best score</button>
+      <button data-s="worst" class="${sortMode==='worst'?'active':''}">Worst score</button>
+    </div>`;
+
+    if(sortMode==="az") rows.sort((a,b)=> a.g.scopeLabel.localeCompare(b.g.scopeLabel));
+    else if(sortMode==="best") rows.sort((a,b)=> b.avgPct - a.avgPct);
+    else if(sortMode==="worst") rows.sort((a,b)=> a.avgPct - b.avgPct);
+    else rows.sort((a,b)=> new Date(b.latest.timestamp) - new Date(a.latest.timestamp));
+
+    if(rows.length===0){
+      html += emptyState("No matches", `Nothing found for "${searchTerm}".`);
+    } else {
+      html += `<div id="listWrap">`;
+      rows.forEach((r, idx)=>{
+        html += rowHtml({
+          num: String(idx+1).padStart(2,"0"),
+          title: r.g.scopeLabel,
+          sub: `${r.g.attempts.length} attempt${r.g.attempts.length===1?"":"s"} · avg ${r.avgPct}% correct`,
+          count: (r.latest.netScore!==undefined && r.latest.netScore!==null) ? `${r.latest.netScore} pts` : `${r.latest.correctCount}/${r.latest.totalCount}`,
+          dataAttr: `data-scope-key="${escapeHtml(r.g.scopeKey)}" data-scope-label="${escapeHtml(r.g.scopeLabel)}"`
+        });
+      });
+      html += `</div>`;
+    }
     mainEl.innerHTML = html;
     document.querySelectorAll("#listWrap .row").forEach(row=>{
       row.addEventListener("click", ()=> pushScreen({ type:"attempts-for-scope", groupBy: grouping, scopeKey: row.dataset.scopeKey, scopeLabel: row.dataset.scopeLabel }));
     });
+    document.querySelectorAll("#sortSeg button").forEach(btn=>{
+      btn.addEventListener("click", ()=>{ screen.attemptsSort = btn.dataset.s; render(); });
+    });
+    bindSearchInput(renderAttemptsRoot);
   }
 
   document.querySelectorAll("#groupSeg button").forEach(btn=>{
@@ -2092,31 +2362,142 @@ function computePriorityList(){
     topicItems: topicItems.sort((a,b)=>b.priority-a.priority)
   };
 }
+function computeTimeStats(){
+  const cur = getCurrentSyllabusId();
+  const bySubject = {}, byTopic = {};
+  (DATA.attempts||[]).forEach(a=>{
+    if(a.type!=="bank" && a.syllabus_id!==cur) return;
+    a.answers.forEach(rec=>{
+      if(!rec.timeMs || rec.timeMs<=0) return;
+      if(!bySubject[rec.subject]) bySubject[rec.subject] = {totalMs:0,count:0};
+      bySubject[rec.subject].totalMs += rec.timeMs; bySubject[rec.subject].count++;
+      const key = `${rec.subject}|||${rec.topic}`;
+      if(!byTopic[key]) byTopic[key] = {subject:rec.subject, topic:rec.topic, totalMs:0, count:0};
+      byTopic[key].totalMs += rec.timeMs; byTopic[key].count++;
+    });
+  });
+  return { bySubject, byTopic };
+}
+function timeStatsBlockHtml(title, entries){
+  if(entries.length===0) return "";
+  const maxMs = Math.max(...entries.map(e=>e.avgMs), 1);
+  let html = `<div class="chart-block"><div class="chart-title">${escapeHtml(title)}</div><div style="max-height:280px;overflow-y:auto;">`;
+  entries.forEach(e=>{
+    const pct = Math.round(100*e.avgMs/maxMs);
+    html += `<div class="bar-row">
+      <div class="bar-label">${escapeHtml(e.label)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:var(--gold);"></div></div>
+      <div class="bar-val">${formatDuration(e.avgMs)}</div>
+    </div>`;
+  });
+  html += `</div></div>`;
+  return html;
+}
+
+/* ---- Wrong-answers queue: latest attempt per question, only if still wrong/unanswered ---- */
+function collectWrongQuestions(){
+  const cur = getCurrentSyllabusId();
+  const latestByKey = {};
+  (DATA.attempts||[]).filter(a=> a.type==="bank" || a.syllabus_id===cur).forEach(a=>{
+    const ts = new Date(a.timestamp).getTime();
+    a.answers.forEach(rec=>{
+      if(!rec.isGraded) return;
+      const key = `${rec.paperId}::${rec.qid}`;
+      if(!latestByKey[key] || latestByKey[key].ts < ts) latestByKey[key] = { ts, rec };
+    });
+  });
+  const idxMap = buildQuestionIndex();
+  const out = [];
+  Object.values(latestByKey).forEach(({rec})=>{
+    if(rec.isCorrect) return;
+    const q = idxMap[`${rec.paperId}::${rec.qid}`];
+    if(q) out.push(q);
+  });
+  return out;
+}
+
 function priorityBadgeHtml(item){
   if(!item.practiced) return `<span class="pr-badge untried">Not yet practiced</span>`;
   if(item.accuracy<0.5) return `<span class="pr-badge weak">${Math.round(item.accuracy*100)}% accuracy</span>`;
   return `<span class="pr-badge ok">${Math.round(item.accuracy*100)}% accuracy</span>`;
 }
+function accColor(practiced, pct){
+  if(!practiced) return "var(--text-dim-on-ink)";
+  return pct>=70 ? "var(--good)" : pct>=40 ? "var(--gold)" : "var(--bad)";
+}
+
+function bindStatsQuickActions(){
+  const wrongBtn = document.getElementById("practiceWrongBtn");
+  if(wrongBtn && !wrongBtn.disabled){
+    wrongBtn.addEventListener("click", ()=>{
+      const qs = collectWrongQuestions();
+      openStartTestModal("wrong-review", "wrong-review", "Wrong-answer review", qs, getCurrentSyllabusId());
+    });
+  }
+  const flagBtn = document.getElementById("reviewFlaggedBtn");
+  if(flagBtn && !flagBtn.disabled) flagBtn.addEventListener("click", ()=> pushScreen({ type:"flagged-list" }));
+  const weakBtn = document.getElementById("weakBankBtn");
+  if(weakBtn) weakBtn.addEventListener("click", openWeakAreaBankModal);
+  const mockBtn = document.getElementById("mockExamBtn");
+  if(mockBtn) mockBtn.addEventListener("click", openMockExamModal);
+}
 
 function renderStatsScreen(){
+  const screen = currentScreen();
   const cur = getCurrentSyllabusId();
   const attempts = (DATA.attempts||[]).filter(a=> a.type==="bank" || a.syllabus_id===cur);
   const totalAttempts = attempts.length;
   let totalGraded=0, totalCorrect=0;
   attempts.forEach(a=>{ a.answers.forEach(r=>{ if(r.isGraded){ totalGraded++; if(r.isCorrect) totalCorrect++; } }); });
   const overallPct = totalGraded? Math.round(100*totalCorrect/totalGraded) : null;
+  const { streak, today } = computeStreak();
+  const wrongQs = collectWrongQuestions();
+  const flaggedQs = collectFlaggedQuestions();
 
   let html = `<div class="detail-head"><div style="width:100%"><h2>Performance</h2><div class="meta">${escapeHtml(getSyllabusById(cur).name)} syllabus</div></div></div>`;
 
   html += `<div class="stat-cards">
     <div class="stat-card"><div class="num">${totalAttempts}</div><div class="label">Tests taken</div></div>
-    <div class="stat-card"><div class="num">${totalGraded}</div><div class="label">Questions answered</div></div>
-    <div class="stat-card"><div class="num">${overallPct===null?"—":overallPct+"%"}</div><div class="label">Overall accuracy</div></div>
+    <div class="stat-card"><div class="num">${overallPct===null?"—":overallPct+"%"}</div><div class="label">Accuracy</div></div>
+    <div class="stat-card"><div class="num">🔥${streak}</div><div class="label">Day streak</div></div>
+    <div class="stat-card"><div class="num">${today}</div><div class="label">Today</div></div>
   </div>`;
+
+  html += `<div class="chart-block">
+    <div class="chart-title">Quick practice</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <button class="iconbtn ${wrongQs.length?"primary":""}" id="practiceWrongBtn" style="flex:1;justify-content:center;" ${wrongQs.length===0?"disabled":""}>❌ Wrong (${wrongQs.length})</button>
+      <button class="iconbtn" id="reviewFlaggedBtn" style="flex:1;justify-content:center;" ${flaggedQs.length===0?"disabled":""}>⭐ Flagged (${flaggedQs.length})</button>
+    </div>
+    <div style="display:flex;gap:8px;">
+      <button class="iconbtn" id="weakBankBtn" style="flex:1;justify-content:center;">📦 Bank from weak areas</button>
+      <button class="iconbtn" id="mockExamBtn" style="flex:1;justify-content:center;">🎯 Mock exam</button>
+    </div>
+  </div>`;
+
+  const due = dueForReviewList();
+  if(due.length>0){
+    html += `<div class="chart-block">
+      <div class="chart-title">Due for review (${due.length})</div>
+      <div class="chart-note">Based on a spaced-repetition schedule from when you last marked each topic studied.</div>
+      <div style="max-height:240px;overflow-y:auto;">`;
+    due.slice(0,40).forEach(d=>{
+      const daysOverdue = Math.floor((Date.now()-d.info.nextReviewAt)/86400000);
+      html += `<button type="button" class="priority-row" style="width:100%;text-align:left;background:none;border:none;cursor:pointer;" data-due-subject="${escapeHtml(d.subject)}" data-due-topic="${escapeHtml(d.topic)}">
+        <div class="pr-main"><div class="pr-title">${escapeHtml(d.topic)}</div><div class="pr-sub">${escapeHtml(d.subject)} · studied ${d.info.count}×</div></div>
+        <span class="pr-badge weak">${daysOverdue<=0?"due today":daysOverdue+"d overdue"}</span>
+      </button>`;
+    });
+    html += `</div></div>`;
+  }
 
   if(totalAttempts===0){
     html += emptyState("No practice tests yet", "Start one from any paper, subject, or topic listing to see your stats here.");
     mainEl.innerHTML = html;
+    bindStatsQuickActions();
+    document.querySelectorAll("[data-due-subject]").forEach(btn=>{
+      btn.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: btn.dataset.dueSubject, topic: btn.dataset.dueTopic }));
+    });
     return;
   }
 
@@ -2133,51 +2514,296 @@ function renderStatsScreen(){
   });
   html += `</div>`;
 
-  const subjAcc = computeAccuracyBySubject();
-  const subjRows = Object.entries(subjAcc).map(([s,v])=>({subject:s, pct: v.total? Math.round(100*v.correct/v.total):0}))
-    .sort((a,b)=>a.pct-b.pct);
-  if(subjRows.length){
-    html += `<div class="chart-block"><div class="chart-title">Accuracy by subject (weakest first)</div><div style="max-height:280px;overflow-y:auto;">`;
-    subjRows.forEach(r=>{
-      const color = r.pct>=70? "var(--good)" : r.pct>=40? "var(--gold)" : "var(--bad)";
-      html += `<div class="bar-row">
-        <div class="bar-label">${escapeHtml(r.subject)}</div>
-        <div class="bar-track"><div class="bar-fill" style="width:${r.pct}%;background:${color};"></div></div>
-        <div class="bar-val">${r.pct}%</div>
-      </div>`;
-    });
-    html += `</div></div>`;
-  }
-
-  const { subjectItems, topicItems } = computePriorityList();
+  // Sortable, drill-down subject performance
+  const sortMode = screen.statsSort || "weak";
+  const subjAccMap = computeAccuracyBySubject();
+  const subjCounts = computeQuestionCountsBySubject();
+  let subjRows = Object.keys(subjCounts).map(s=>{
+    const acc = subjAccMap[s];
+    const practiced = !!acc && acc.total>0;
+    const pct = practiced ? Math.round(100*acc.correct/acc.total) : null;
+    return { subject:s, freq:subjCounts[s], practiced, pct, answered: practiced?acc.total:0 };
+  });
+  if(sortMode==="strong") subjRows.sort((a,b)=> (b.pct===null?-1:b.pct) - (a.pct===null?-1:a.pct));
+  else if(sortMode==="most") subjRows.sort((a,b)=> b.freq-a.freq);
+  else subjRows.sort((a,b)=> (a.pct===null?-1:a.pct) - (b.pct===null?-1:b.pct));
 
   html += `<div class="chart-block">
-    <div class="chart-title">Priority study areas — every subject & topic</div>
-    <div class="chart-note">Ranked by how often each appears in your question bank, weighted against how much you're struggling with it (or haven't tried it yet). A simple heuristic, not a guarantee.</div>`;
-
-  html += `<div style="margin-top:10px;"><div class="taxo-group-title">By subject (${subjectItems.length})</div>
-    <div style="max-height:360px;overflow-y:auto;">`;
-  subjectItems.forEach((item, idx)=>{
-    html += `<div class="priority-row">
+    <div class="chart-title">Subject performance — tap to see its topics</div>
+    <div class="segmented" id="statsSortSeg">
+      <button data-s="weak" class="${sortMode==='weak'?'active':''}">Weakest first</button>
+      <button data-s="strong" class="${sortMode==='strong'?'active':''}">Strongest first</button>
+      <button data-s="most" class="${sortMode==='most'?'active':''}">Most in bank</button>
+    </div>
+    <div style="max-height:400px;overflow-y:auto;margin-top:8px;">`;
+  subjRows.forEach((r,idx)=>{
+    const pctLabel = r.practiced ? r.pct+"%" : "Not tried";
+    html += `<div class="priority-row" style="cursor:pointer;" data-stats-subject="${escapeHtml(r.subject)}">
       <div class="pr-rank">${idx+1}</div>
-      <div class="pr-main"><div class="pr-title">${escapeHtml(item.label)}</div><div class="pr-sub">${item.freq} question${item.freq===1?"":"s"} in your bank</div></div>
-      ${priorityBadgeHtml(item)}
+      <div class="pr-main"><div class="pr-title">${escapeHtml(r.subject)}</div><div class="pr-sub">${r.freq} question${r.freq===1?"":"s"} in bank${r.practiced?` · ${r.answered} answered`:""}</div></div>
+      <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${pctLabel}</span>
     </div>`;
   });
   html += `</div></div>`;
 
-  html += `<div style="margin-top:14px;"><div class="taxo-group-title">By topic (${topicItems.length})</div>
-    <div style="max-height:420px;overflow-y:auto;">`;
-  topicItems.forEach((item, idx)=>{
-    html += `<div class="priority-row">
-      <div class="pr-rank">${idx+1}</div>
-      <div class="pr-main"><div class="pr-title">${escapeHtml(item.label)}</div><div class="pr-sub">${escapeHtml(item.sublabel)} · ${item.freq} question${item.freq===1?"":"s"}</div></div>
-      ${priorityBadgeHtml(item)}
-    </div>`;
-  });
-  html += `</div></div></div>`;
+  const timeStats = computeTimeStats();
+  const subjTimeEntries = Object.entries(timeStats.bySubject).map(([s,v])=>({label:s, avgMs: v.totalMs/v.count})).sort((a,b)=>b.avgMs-a.avgMs).slice(0,8);
+  const topicTimeEntries = Object.values(timeStats.byTopic).map(v=>({label:`${v.topic} (${v.subject})`, avgMs: v.totalMs/v.count})).sort((a,b)=>b.avgMs-a.avgMs).slice(0,8);
+  if(subjTimeEntries.length){
+    html += timeStatsBlockHtml("Avg time per question by subject (slowest first)", subjTimeEntries);
+    html += timeStatsBlockHtml("Avg time per question by topic (slowest first)", topicTimeEntries);
+  } else {
+    html += `<div class="chart-note" style="margin:14px 2px;">Time-per-question stats appear once you take a test in swipe view (timing isn't tracked in scroll view).</div>`;
+  }
 
   mainEl.innerHTML = html;
+  bindStatsQuickActions();
+  document.querySelectorAll("[data-due-subject]").forEach(btn=>{
+    btn.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: btn.dataset.dueSubject, topic: btn.dataset.dueTopic }));
+  });
+  document.querySelectorAll("#statsSortSeg button").forEach(btn=>{
+    btn.addEventListener("click", ()=>{ screen.statsSort = btn.dataset.s; render(); });
+  });
+  document.querySelectorAll("[data-stats-subject]").forEach(row=>{
+    row.addEventListener("click", ()=> pushScreen({ type:"stats-subject", subject: row.dataset.statsSubject }));
+  });
+}
+
+function renderStatsSubject(subject){
+  const screen = currentScreen();
+  const sortMode = screen.statsSort2 || "weak";
+  const topicAccMap = computeAccuracyByTopic();
+  const topicCounts = computeQuestionCountsByTopic();
+  let rows = Object.keys(topicCounts).filter(k=>k.startsWith(subject+"|||")).map(k=>{
+    const topic = k.slice(subject.length+3);
+    const acc = topicAccMap[k];
+    const practiced = !!acc && acc.total>0;
+    const pct = practiced ? Math.round(100*acc.correct/acc.total) : null;
+    return { topic, freq: topicCounts[k], practiced, pct, studied: getStudyCount(subject,topic), attemptCount: countTopicAttempts(subject,topic) };
+  });
+
+  if(sortMode==="strong") rows.sort((a,b)=> (b.pct===null?-1:b.pct)-(a.pct===null?-1:a.pct));
+  else if(sortMode==="most") rows.sort((a,b)=> b.freq-a.freq);
+  else rows.sort((a,b)=> (a.pct===null?-1:a.pct)-(b.pct===null?-1:b.pct));
+
+  let html = `<div class="detail-head">
+    <div style="width:100%">
+      <div class="backrow" id="backBtn">‹ Back to Stats</div>
+      <h2>${escapeHtml(subject)}</h2>
+      <div class="meta">${rows.length} topic${rows.length===1?"":"s"} in this subject</div>
+    </div>
+  </div>`;
+  html += `<div class="segmented" id="statsSortSeg2">
+    <button data-s="weak" class="${sortMode==='weak'?'active':''}">Weakest first</button>
+    <button data-s="strong" class="${sortMode==='strong'?'active':''}">Strongest first</button>
+    <button data-s="most" class="${sortMode==='most'?'active':''}">Most in bank</button>
+  </div>`;
+
+  if(rows.length===0){
+    html += emptyState("No topics here", "");
+  } else {
+    html += `<div style="margin-top:8px;">`;
+    rows.forEach((r,idx)=>{
+      const pctLabel = r.practiced ? r.pct+"%" : "Not tried";
+      const bits = [`${r.freq} q`];
+      if(r.studied) bits.push(`📖 ${r.studied}×`);
+      if(r.attemptCount) bits.push(`📝 ${r.attemptCount}`);
+      html += `<div class="priority-row" style="cursor:pointer;" data-stats-topic="${escapeHtml(r.topic)}">
+        <div class="pr-rank">${idx+1}</div>
+        <div class="pr-main"><div class="pr-title">${escapeHtml(r.topic)}</div><div class="pr-sub">${bits.join(" · ")}</div></div>
+        <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${pctLabel}</span>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  mainEl.innerHTML = html;
+  document.getElementById("backBtn").addEventListener("click", popScreen);
+  document.querySelectorAll("#statsSortSeg2 button").forEach(btn=>{
+    btn.addEventListener("click", ()=>{ screen.statsSort2 = btn.dataset.s; render(); });
+  });
+  document.querySelectorAll("[data-stats-topic]").forEach(row=>{
+    row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject, topic: row.dataset.statsTopic }));
+  });
+}
+
+function renderFlaggedList(){
+  const questions = collectFlaggedQuestions();
+  renderQuestionListScreen({
+    backLabel: "Back to Stats",
+    onBack: popScreen,
+    title: "Flagged questions",
+    meta: `${questions.length} question${questions.length===1?"":"s"}`,
+    questions,
+    allowPractice: true,
+    practiceInfo: { sourceType:"flagged", scopeKey:"flagged", scopeLabel:"Flagged questions", syllabusId: getCurrentSyllabusId() }
+  });
+}
+
+/* ---- Build a practice bank from the current priority (weak-area) list ---- */
+function openWeakAreaBankModal(){
+  modalRoot.innerHTML = `
+  <div class="modal-backdrop" id="backdrop">
+    <div class="modal">
+      <h3>Build a bank from weak areas</h3>
+      <div class="field"><label>How many topics to pull from (ranked by priority)</label><input type="number" id="weakTopN" min="1" max="30" value="8"></div>
+      <div class="field"><label>Max questions per topic</label><input type="number" id="weakPerArea" min="1" max="50" value="10"></div>
+      <div class="row-btns">
+        <button class="iconbtn" id="cancelWeak" style="flex:1;justify-content:center;">Cancel</button>
+        <button class="iconbtn primary" id="confirmWeak" style="flex:1;justify-content:center;">Create bank</button>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("cancelWeak").addEventListener("click", closeModal);
+  document.getElementById("confirmWeak").addEventListener("click", ()=>{
+    const topN = Math.max(1, parseInt(document.getElementById("weakTopN").value,10)||8);
+    const perArea = Math.max(1, parseInt(document.getElementById("weakPerArea").value,10)||10);
+    const { topicItems } = computePriorityList();
+    const chosen = topicItems.slice(0, topN);
+    const qs = visibleQuestions();
+    const refs = [];
+    const seen = new Set();
+    chosen.forEach(item=>{
+      const pool = qs.filter(q=> q.subject===item.sublabel && (q.topic||FALLBACK_TOPIC)===item.label
+        && q.correct_answer_index!==null && q.correct_answer_index!==undefined && Number(q.correct_answer_index)!==DELETED_SENTINEL);
+      sampleRandom(pool, perArea).forEach(q=>{
+        const key = `${q._paperId}::${q.id}`;
+        if(!seen.has(key)){ seen.add(key); refs.push({ paperId:q._paperId, qid:String(q.id) }); }
+      });
+    });
+    if(refs.length===0){ alert("No gradable questions found in your top weak areas yet."); return; }
+    const name = `Weak areas – ${new Date().toLocaleDateString()}`;
+    const bank = { id: slugify(name), name, questionRefs: refs };
+    DATA.banks.push(bank);
+    saveData(DATA);
+    closeModal();
+    pushScreen({ type:"bank" });
+    pushScreen({ type:"bank-detail", bankId: bank.id });
+    toast(`Created bank with ${refs.length} question(s)`);
+  });
+}
+
+/* ---- Mock exam: weighted random sampling by subject ---- */
+function distributeProportionally(items, target){
+  const totalFreq = items.reduce((s,i)=>s+i.freq, 0) || 1;
+  const cappedTarget = Math.min(target, totalFreq);
+  const raw = items.map(i=>({ key:i.key, freq:i.freq, exact: Math.min(i.freq, cappedTarget*i.freq/totalFreq) }));
+  const floors = raw.map(r=>({ key:r.key, freq:r.freq, floor: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
+  let allocated = floors.reduce((s,f)=>s+f.floor, 0);
+  let remaining = cappedTarget - allocated;
+  const result = {};
+  floors.forEach(f=>{ result[f.key] = f.floor; });
+  floors.sort((a,b)=> b.rem - a.rem);
+  for(let i=0; i<floors.length && remaining>0; i++){
+    if(result[floors[i].key] < floors[i].freq){ result[floors[i].key]++; remaining--; }
+  }
+  return result;
+}
+function openMockExamModal(){
+  const qs = visibleQuestions().filter(q=> q.correct_answer_index!==null && q.correct_answer_index!==undefined && Number(q.correct_answer_index)!==DELETED_SENTINEL);
+  const bySubject = {};
+  qs.forEach(q=>{ if(!bySubject[q.subject]) bySubject[q.subject]=[]; bySubject[q.subject].push(q); });
+  const subjects = Object.keys(bySubject).sort((a,b)=>a.localeCompare(b));
+  if(subjects.length===0){ alert("No gradable questions in this syllabus yet."); return; }
+  let counts = {}; subjects.forEach(s=> counts[s] = 0);
+
+  function draw(){
+    const total = Object.values(counts).reduce((a,b)=>a+b,0);
+    modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="backdrop">
+      <div class="modal">
+        <h3>Create mock exam</h3>
+        <div class="meta" style="margin-bottom:10px;">Auto-distribute a target total proportionally to each subject's share of your question bank, or set counts manually.</div>
+        <div class="field" style="display:flex;gap:8px;align-items:flex-end;">
+          <div style="flex:1;"><label>Target total</label><input type="number" id="mockTarget" min="1" value="50"></div>
+          <button class="iconbtn" id="autoDistBtn">Auto-distribute</button>
+        </div>
+        <div class="divider">— per-subject counts —</div>
+        <div id="mockSubjList" style="max-height:38vh;overflow-y:auto;">
+          ${subjects.map(s=>`<div class="marking-row" style="justify-content:space-between;">
+            <span style="flex:1;">${escapeHtml(s)} <span class="meta">(${bySubject[s].length} available)</span></span>
+            <input type="number" class="mockCountInput" data-subject="${escapeHtml(s)}" min="0" max="${bySubject[s].length}" value="${counts[s]}" style="width:64px;">
+          </div>`).join("")}
+        </div>
+        <div class="meta" style="margin:8px 0;">Total selected: <strong id="mockTotalLabel">${total}</strong></div>
+        <div class="row-btns">
+          <button class="iconbtn" id="cancelMock" style="flex:1;justify-content:center;">Cancel</button>
+          <button class="iconbtn primary" id="confirmMock" style="flex:1;justify-content:center;">Continue</button>
+        </div>
+      </div>
+    </div>`;
+    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+    document.getElementById("cancelMock").addEventListener("click", closeModal);
+    document.querySelectorAll(".mockCountInput").forEach(inp=>{
+      inp.addEventListener("input", ()=>{
+        counts[inp.dataset.subject] = Math.max(0, Math.min(bySubject[inp.dataset.subject].length, parseInt(inp.value,10)||0));
+        const lbl = document.getElementById("mockTotalLabel");
+        if(lbl) lbl.textContent = Object.values(counts).reduce((a,b)=>a+b,0);
+      });
+    });
+    document.getElementById("autoDistBtn").addEventListener("click", ()=>{
+      const target = Math.max(1, parseInt(document.getElementById("mockTarget").value,10)||50);
+      counts = distributeProportionally(subjects.map(s=>({key:s, freq:bySubject[s].length})), target);
+      draw();
+    });
+    document.getElementById("confirmMock").addEventListener("click", ()=>{
+      const chosen = [];
+      subjects.forEach(s=>{ sampleRandom(bySubject[s], counts[s]||0).forEach(q=> chosen.push(q)); });
+      if(chosen.length===0){ alert("Set at least one question count first."); return; }
+      closeModal();
+      openStartTestModal("mock", "mock-exam", `Mock Exam (${chosen.length}q)`, chosen, getCurrentSyllabusId());
+    });
+  }
+  draw();
+}
+
+/* ---- Global search across every syllabus and paper ---- */
+function openGlobalSearchModal(){
+  let term = "";
+  const all = allQuestions();
+  function results(){
+    if(!term.trim()) return [];
+    const t = term.toLowerCase();
+    return all.filter(q=> q.question_text.toLowerCase().includes(t) || q.subject.toLowerCase().includes(t) || (q.topic||"").toLowerCase().includes(t) || q._paperName.toLowerCase().includes(t)).slice(0,80);
+  }
+  function draw(){
+    const list = results();
+    modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="backdrop">
+      <div class="modal">
+        <h3>Search all questions</h3>
+        <input class="search" id="globalSearchInput" placeholder="Search text, subject, topic, paper…" value="${escapeHtml(term)}">
+        <div class="meta" style="margin:6px 0;">${term.trim() ? `${list.length} match${list.length===1?"":"es"} (showing up to 80)` : "Across every syllabus and paper"}</div>
+        <div id="globalSearchResults" style="max-height:50vh;overflow-y:auto;">
+          ${list.map(q=>`<button type="button" class="check-item" data-open-paper="${escapeHtml(q._paperId)}">
+            <span style="flex:1;">
+              <div style="font-size:0.85rem;">${escapeHtml(q.question_text.slice(0,110))}${q.question_text.length>110?"…":""}</div>
+              <div class="ci-sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div>
+            </span>
+          </button>`).join("")}
+        </div>
+        <div class="row-btns"><button class="iconbtn" id="closeSearch" style="width:100%;justify-content:center;">Close</button></div>
+      </div>
+    </div>`;
+    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+    document.getElementById("closeSearch").addEventListener("click", closeModal);
+    document.getElementById("globalSearchInput").addEventListener("input",(e)=>{
+      const pos = e.target.selectionStart;
+      term = e.target.value; draw();
+      const nb = document.getElementById("globalSearchInput");
+      if(nb){ nb.focus(); nb.setSelectionRange(pos,pos); }
+    });
+    document.querySelectorAll("[data-open-paper]").forEach(btn=>{
+      btn.addEventListener("click", ()=>{
+        const paperId = btn.dataset.openPaper;
+        closeModal();
+        resetToTab("papers");
+        pushScreen({ type:"paper-detail", paperId });
+      });
+    });
+  }
+  draw();
 }
 
 /* ================= Topic reassignment modal ================= */
@@ -2516,6 +3142,13 @@ function attemptAddPaper(){
   if(errs.length){ setStatus(statusEl,"err","Problems found:\n"+errs.join("\n")); return; }
 
   const existingIdx = DATA.papers.findIndex(p=>p.id===parsed.paper.id);
+  const dupes = findDuplicateQuestions(parsed.questions, parsed.paper.id);
+  if(dupes.length>0){
+    const preview = dupes.slice(0,4).map(d=> `• "${d.text.slice(0,50)}${d.text.length>50?"…":""}" — also in ${d.paperName}`).join("\n");
+    const msg = `${dupes.length} question(s) in this paper look like they already exist in other papers:\n\n${preview}${dupes.length>4?`\n…and ${dupes.length-4} more`:""}\n\nThis is common when papers repeat questions across years — add anyway?`;
+    if(!confirm(msg)) return;
+  }
+
   const carriedPostName = existingIdx>=0 ? (DATA.papers[existingIdx].post_name||"") : "";
   const carriedSyllabus = existingIdx>=0 ? (DATA.papers[existingIdx].syllabus_id||"default") : getCurrentSyllabusId();
   const paperObj = {
@@ -2531,6 +3164,27 @@ function attemptAddPaper(){
   closeModal();
   resetToTab("papers");
   toast(existingIdx>=0 ? "Paper updated" : "Paper added");
+}
+function normalizeQuestionText(t){
+  return String(t||"").toLowerCase().replace(/[^a-z0-9\u0d00-\u0d7f]+/g," ").trim();
+}
+function findDuplicateQuestions(newQuestions, excludePaperId){
+  const existingMap = {};
+  DATA.papers.forEach(p=>{
+    if(p.id===excludePaperId) return;
+    (p.questions||[]).forEach(q=>{
+      const norm = normalizeQuestionText(q.question_text);
+      if(norm.length<10) return; // too short to be a meaningful match
+      if(!existingMap[norm]) existingMap[norm] = p.name;
+    });
+  });
+  const out = [];
+  (newQuestions||[]).forEach(q=>{
+    const norm = normalizeQuestionText(q.question_text);
+    if(norm.length<10) return;
+    if(existingMap[norm]) out.push({ text: q.question_text, paperName: existingMap[norm] });
+  });
+  return out;
 }
 
 function validatePaperJson(parsed){
@@ -2877,6 +3531,8 @@ function loadDataFromObject(parsed){
   if(!Array.isArray(parsed.banks)) parsed.banks = [];
   if(!Array.isArray(parsed.paperTemplates)) parsed.paperTemplates = [];
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
+  migrateStudyProgress(parsed.studyProgress);
+  if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};
   if(!Array.isArray(parsed.syllabuses) || parsed.syllabuses.length===0){
     parsed.syllabuses = [{ id:"default", name:"Default", marking: Object.assign({}, DEFAULT_MARKING) }];
   }
