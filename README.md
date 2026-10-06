@@ -108,3 +108,11 @@ to have an AI generate it from a PDF.
 - **Topic lists** (named, renamable, built from the syllabus) and **colour labels** for topics.
 - **Stats sub-tabs**: Overview, Subjects, Time, Difficulty, Guesswork; "View all topics" list with the same sorts.
 - Optional `"difficulty": "E"|"M"|"D"` and `"note": "..."` fields are accepted in question JSON.
+
+## AI features (bring your own key)
+Tap **🤖** next to the syllabus button → add presets (OpenRouter, Gemini, Groq, OpenAI, Anthropic, DeepSeek, Mistral, or any OpenAI-compatible URL). Keys are stored only in this browser and are never included in backups. Order presets by priority; with auto-switch on, the app moves to the next preset when one hits its limit or fails.
+- **🤖 on a question / "Explain my mistake" in test review:** explain, mnemonic, revision note; save as explanation or note.
+- **🧩 Similar questions / topic page "AI practice questions":** generates MCQs, you review them, then they go into an "AI Practice Questions" paper.
+- **Stats → Overview → AI tools:** study plan from your weak, slow and guess-heavy topics; memory tricks for wrong answers.
+- **Stats → Guesswork → AI guess coach.**
+AI output can be wrong — verify facts before relying on it. Model names change; edit them in the preset.

@@ -134,11 +134,6 @@ function countTopicAttempts(subject, topic){
   const cur = getCurrentSyllabusId();
   return (DATA.attempts||[]).filter(a=> a.type==="topic" && a.scopeKey===key && a.syllabus_id===cur).length;
 }
-function countTopicAttempts(subject, topic){
-  const key = `${subject}|||${topic}`;
-  const cur = getCurrentSyllabusId();
-  return (DATA.attempts||[]).filter(a=> a.type==="topic" && a.scopeKey===key && a.syllabus_id===cur).length;
-}
 
 /* ---- Daily activity streak ---- */
 function todayKey(){ return new Date().toISOString().slice(0,10); }
@@ -1124,6 +1119,9 @@ function renderTopicDetail(subject, topic){
   <div style="display:flex;gap:8px;margin:0 0 4px;">
     <button class="iconbtn" id="filterPapersBtn" style="flex:1;justify-content:center;">${filterLabel}</button>
     <button class="iconbtn" id="labelTopicBtn" style="flex:1;justify-content:center;">${currentLabel ? `🏷️ ${escapeHtml(currentLabel.name)}` : "🏷️ Add label"}</button>
+  </div>
+  <div style="display:flex;gap:8px;margin:0 0 4px;">
+    <button class="iconbtn" data-ai="gen-topic" data-subject="${escapeHtml(subject)}" data-topic="${escapeHtml(topic)}" style="flex:1;justify-content:center;">🤖 AI practice questions</button>
   </div>`;
 
   renderQuestionListScreen({
@@ -1205,6 +1203,7 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
         <button class="actbtn ${hasNote?"has-note":""}" data-action="edit-note" title="Notes">${hasNote?"🗒️":"📄"}</button>
         <button class="actbtn" data-action="copy-question" title="Copy this question">📋</button>
         <button class="actbtn" data-action="edit-question" title="Edit question">📝</button>
+        <button class="actbtn" data-ai="q" data-paper="${escapeHtml(q._paperId)}" data-qid="${escapeHtml(q.id)}" title="AI help">🤖</button>
       </div>
       <div class="grp">
         <button class="actbtn danger" data-action="toggle-deleted" title="Toggle deleted-by-PSC status">${isDeleted?"↺":"🚫"}</button>
@@ -1359,18 +1358,6 @@ function deleteQuestion(paperId, qid){
   if(!paper) return;
   paper.questions = (paper.questions||[]).filter(qq=>String(qq.id)!==qid);
   saveData(DATA);
-}
-function toggleFlag(paperId, qid){
-  const paper = DATA.papers.find(p=>p.id===paperId);
-  if(!paper) return false;
-  const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
-  if(!q) return false;
-  q.flagged = !q.flagged;
-  saveData(DATA);
-  return q.flagged;
-}
-function collectFlaggedQuestions(){
-  return visibleQuestions().filter(q=>q.flagged);
 }
 function toggleFlag(paperId, qid){
   const paper = DATA.papers.find(p=>p.id===paperId);
@@ -2121,6 +2108,7 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
     <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options">${opts}</ul>
     ${expl}
+    <button type="button" class="ai-inline-btn" data-ai="q" data-paper="${escapeHtml(q._paperId)}" data-qid="${escapeHtml(q.id)}" data-sel="${rec.selectedIndex===null||rec.selectedIndex===undefined?"none":rec.selectedIndex}">🤖 ${isGraded && rec.selectedIndex!==null && !rec.isCorrect ? "Explain my mistake" : "AI help"}</button>
   </div>`;
 }
 function formatDuration(ms){
@@ -2871,6 +2859,11 @@ function statsOverviewHtml(attempts){
       <button class="iconbtn" id="mockExamBtn" style="flex:1;justify-content:center;">🎯 Mock exam</button>
     </div>
   </div>`;
+  html += `<div class="chart-block"><div class="chart-title">🤖 AI tools</div>
+    <div style="display:flex;gap:8px;">
+      <button class="iconbtn" data-ai="plan" style="flex:1;justify-content:center;">🗓️ Study plan</button>
+      <button class="iconbtn" data-ai="wrong-mnemonics" style="flex:1;justify-content:center;">🧠 Tricks for wrong</button>
+    </div></div>`;
   const due = dueForReviewList();
   if(due.length>0){
     html += `<div class="chart-block"><div class="chart-title">Due for review (${due.length})</div>
@@ -2998,7 +2991,7 @@ function guessSummary(arr, mk){
 function statsGuessHtml(recs, screen){
   const mk = currentMarking();
   const all = guessSummary(recs, mk);
-  let html = `<div class="chart-block"><div class="chart-title">How guessing pays off</div>
+  let html = `<button class="iconbtn" data-ai="guess-coach" style="width:100%;justify-content:center;margin-bottom:10px;">🎓 AI guess coach</button><div class="chart-block"><div class="chart-title">How guessing pays off</div>
     <div class="chart-note">Marking: +${mk.pos} right, −${Math.round(mk.pen*100)/100} wrong. Break-even accuracy = penalty ÷ (mark + penalty) = <b>${Math.round(mk.breakEven*1000)/10}%</b>. Guess only when your chance of being right is above this; below it, guessing loses marks on average.</div></div>`;
   if(!all.n) return html + `<div class="chart-note" style="margin:14px 2px;">Tap “🤔 Guess” on a question during a test to start collecting guess data.</div>`;
   const marks = r=> (r>0?"+":"")+r;
