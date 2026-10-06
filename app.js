@@ -180,12 +180,12 @@ function getAllSubjects(){
   // must still be selectable/findable everywhere, or renaming/reassigning
   // can silently "lose" it.
   const set = new Set(Object.keys(TAXONOMY_STATE));
-  allQuestions().forEach(q=>{ if(q.subject) set.add(q.subject); });
+  pyqAllQuestions().forEach(q=>{ if(q.subject) set.add(q.subject); });
   return Array.from(set);
 }
 function getTopicsForSubject(subject){
   const set = new Set(TAXONOMY_STATE[subject] || [FALLBACK_TOPIC]);
-  allQuestions().forEach(q=>{ if(q.subject===subject && q.topic) set.add(q.topic); });
+  pyqAllQuestions().forEach(q=>{ if(q.subject===subject && q.topic) set.add(q.topic); });
   set.add(FALLBACK_TOPIC);
   return Array.from(set);
 }
@@ -416,9 +416,20 @@ function allQuestions(){
   });
   return out;
 }
+/* ---- AI-generated questions live in their own paper(s) (id "ai-practice-<syllabus>") and are
+   kept completely apart from PYQs: visibleQuestions() is PYQ-only, visibleAiQuestions() is AI-only. ---- */
+const AI_PAPER_PREFIX = "ai-practice-";
+function isAiPaperId(id){ return String(id||"").indexOf(AI_PAPER_PREFIX)===0; }
+function isAiPaper(p){ return !!p && isAiPaperId(p.id); }
+function pyqAllQuestions(){ return allQuestions().filter(q=>!isAiPaperId(q._paperId)); }
 function visibleQuestions(){
   const cur = getCurrentSyllabusId();
-  const allowed = new Set(DATA.papers.filter(p=>(p.syllabus_id||"default")===cur).map(p=>p.id));
+  const allowed = new Set(DATA.papers.filter(p=>!isAiPaper(p) && (p.syllabus_id||"default")===cur).map(p=>p.id));
+  return allQuestions().filter(q=> allowed.has(q._paperId));
+}
+function visibleAiQuestions(){
+  const cur = getCurrentSyllabusId();
+  const allowed = new Set(DATA.papers.filter(p=>isAiPaper(p) && (p.syllabus_id||"default")===cur).map(p=>p.id));
   return allQuestions().filter(q=> allowed.has(q._paperId));
 }
 function buildQuestionIndex(){
@@ -556,9 +567,10 @@ function render(){
     case "topics": renderTopicsList(); break;
     case "bank": renderBankRoot(); break;
     case "attempts": renderAttemptsRoot(); break;
-    case "stats": renderStatsScreen(); break;
-    case "stats-subject": renderStatsSubject(screen.subject); break;
-    case "stats-all-topics": renderStatsAllTopics(); break;
+    case "stats": withStatsMode(getStatsMode(), renderStatsScreen); break;
+    case "stats-subject": withStatsMode(getStatsMode(), ()=>renderStatsSubject(screen.subject)); break;
+    case "stats-all-topics": withStatsMode(getStatsMode(), renderStatsAllTopics); break;
+    case "ai-questions": renderAiQuestions(); break;
     case "flagged-list": renderFlaggedList(); break;
     case "search-results": renderSearchResults(screen); break;
     case "notes": renderNotesRoot(); break;
@@ -575,7 +587,7 @@ function render(){
   updateTopbarVisibility();
   typesetMath(mainEl);
 }
-const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","practice","attempt-review","flagged-list","search-results"]);
+const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","ai-questions","practice","attempt-review","flagged-list","search-results"]);
 function updateTopbarVisibility(){
   const screen = currentScreen();
   const isRoot = navStack.length===1;
@@ -628,7 +640,7 @@ function emptyState(title, body){
 function renderPapersList(){
   const searchTerm = getSearch();
   const cur = getCurrentSyllabusId();
-  const papers = DATA.papers.filter(p=>(p.syllabus_id||"default")===cur).sort((a,b)=> a.name.localeCompare(b.name));
+  const papers = DATA.papers.filter(p=>!isAiPaper(p) && (p.syllabus_id||"default")===cur).sort((a,b)=> a.name.localeCompare(b.name));
   if(papers.length === 0){
     mainEl.innerHTML = emptyState("No papers in this syllabus yet", "Tap “+ Add” to import a question paper JSON, or switch syllabus above.");
     return;
@@ -666,7 +678,8 @@ function renderSubjectsList(){
     mainEl.innerHTML = emptyState("No subjects yet", "Import a question paper into this syllabus to see subjects here.");
     return;
   }
-  let html = `<input class="search" id="searchBox" placeholder="Search subjects…" value="${escapeHtml(searchTerm)}">`;
+  let html = aiEntryButtonHtml();
+  html += `<input class="search" id="searchBox" placeholder="Search subjects…" value="${escapeHtml(searchTerm)}">`;
   html += `<div id="listWrap">`;
   subjects
     .filter(s=>s.toLowerCase().includes(searchTerm.toLowerCase()))
@@ -773,6 +786,7 @@ function listingInfo(screen){
     case "topic-detail": return { key:"topic:"+screen.subject+"|||"+screen.topic, label:"Topic: "+screen.topic+" ("+screen.subject+")", nav:{ type:"topic-detail", subject:screen.subject, topic:screen.topic } };
     case "bank-detail": { const b=(DATA.banks||[]).find(x=>x.id===screen.bankId); return { key:"bank:"+screen.bankId, label:"Bank: "+(b?b.name:screen.bankId), nav:{ type:"bank-detail", bankId:screen.bankId } }; }
     case "flagged-list": return { key:"flagged", label:"Flagged questions", nav:{ type:"flagged-list" } };
+    case "ai-questions": return { key:"ai:"+(screen.subject||"*")+"|||"+(screen.topic||"*"), label:"AI questions"+(screen.subject?": "+screen.subject+(screen.topic?" › "+screen.topic:""):" (all)"), nav:{ type:"ai-questions", subject:screen.subject||null, topic:screen.topic||null } };
     case "topics": if(screen.topicListSort==="lists" && screen.activeListId){ const l=findTopicList(screen.activeListId); if(l) return { key:"list:"+l.id, label:"Topic list: "+l.name, nav:{ type:"topics", topicListSort:"lists", activeListId:l.id } }; } return null;
     default: return null;
   }
@@ -845,7 +859,7 @@ function renderTopicsList(){
     return { subject, topic, count, label: lbl ? lbl.name : null, studied: getStudyCount(subject, topic) };
   });
 
-  let html = "";
+  let html = aiEntryButtonHtml();
   if(entries.length===0 && sortMode!=="lists"){
     mainEl.innerHTML = emptyState("No topics yet", "Import a question paper into this syllabus to see topics here, ranked by how often they occur.");
     return;
@@ -964,6 +978,7 @@ function renderSubjectTopicsList(subject){
     </div>
   </div>`;
 
+  html += contentSwitchHtml("pyq", subject, null);
   html += `<div style="display:flex;gap:8px;margin:12px 0 4px;">
     <button class="iconbtn" id="renameSubjectBtn" style="flex:1;justify-content:center;">Rename subject</button>
     <button class="iconbtn primary" id="viewAllBtn" style="flex:1;justify-content:center;">View all questions</button>
@@ -1261,7 +1276,7 @@ function renderSubjectAllQuestions(subject){
   const papersList = Object.values(papersMap).sort((a,b)=>a.name.localeCompare(b.name));
   const filterLabel = included ? `Exams: ${included.length}/${papersList.length}` : `Exams: all`;
 
-  const actionsHtml = `<div style="display:flex;gap:8px;margin:12px 0 4px;">
+  const actionsHtml = contentSwitchHtml("pyq", subject, null) + `<div style="display:flex;gap:8px;margin:12px 0 4px;">
     <button class="iconbtn" id="filterPapersBtn" style="flex:1;justify-content:center;">${filterLabel}</button>
     <button class="iconbtn" id="copyListBtn" style="flex:1;justify-content:center;">Copy list</button>
   </div>`;
@@ -1312,7 +1327,7 @@ function renderTopicDetail(subject, topic){
   const studyCount = getStudyCount(subject, topic);
   const attemptCount = countTopicAttempts(subject, topic);
   const currentLabel = getTopicLabel(subject, topic);
-  const actionsHtml = `<div class="stepper left" id="studyStepper">
+  const actionsHtml = contentSwitchHtml("pyq", subject, topic) + `<div class="stepper left" id="studyStepper">
     <span class="study-label">📖 Studied</span>
     <button id="studyMinus" ${studyCount<=0?"disabled":""}>−1</button>
     <div class="val">${studyCount}×</div>
@@ -1330,7 +1345,7 @@ function renderTopicDetail(subject, topic){
     <button class="iconbtn" id="labelTopicBtn" style="flex:1;justify-content:center;">${currentLabel ? `🏷️ ${escapeHtml(currentLabel.name)}` : "🏷️ Add label"}</button>
   </div>
   <div style="display:flex;gap:8px;margin:0 0 4px;">
-    <button class="iconbtn" data-ai="gen-topic" data-subject="${escapeHtml(subject)}" data-topic="${escapeHtml(topic)}" style="flex:1;justify-content:center;">🤖 AI practice questions</button>
+    <button class="iconbtn" data-ai="gen-topic" data-subject="${escapeHtml(subject)}" data-topic="${escapeHtml(topic)}" style="flex:1;justify-content:center;">🤖 Generate AI questions</button>
   </div>`;
 
   renderQuestionListScreen({
@@ -1796,7 +1811,7 @@ function openSyllabusModal(){
 function renderSyllabusModal(){
   const current = getCurrentSyllabusId();
   const rows = DATA.syllabuses.map(s=>{
-    const paperCount = DATA.papers.filter(p=>(p.syllabus_id||"default")===s.id).length;
+    const paperCount = DATA.papers.filter(p=>!isAiPaper(p) && (p.syllabus_id||"default")===s.id).length;
     const isSel = s.id===current;
     return `<div class="template-row">
       <button type="button" class="taxo-item ${isSel?"selected":""}" data-select-syl="${escapeHtml(s.id)}" style="flex:1;margin-bottom:0;">
@@ -2451,9 +2466,137 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
 }
 
 /* ================= Question Bank ================= */
+/* ================= AI-generated questions (kept apart from PYQs) ================= */
+function contentSwitchHtml(mode, subject, topic){
+  const f = q=> (!subject||q.subject===subject) && (!topic||(q.topic||FALLBACK_TOPIC)===topic);
+  const nP = visibleQuestions().filter(f).length, nA = visibleAiQuestions().filter(f).length;
+  const at = `data-subject="${escapeHtml(subject||"")}" data-topic="${escapeHtml(topic||"")}"`;
+  return `<div class="segmented content-seg" style="margin:10px 0 6px;">
+    <button type="button" data-cs="pyq" ${at} class="${mode==="pyq"?"active":""}">📚 PYQs (${nP})</button>
+    <button type="button" data-cs="ai" ${at} class="${mode==="ai"?"active":""}">🤖 AI questions (${nA})</button></div>`;
+}
+function aiEntryButtonHtml(){
+  const n = visibleAiQuestions().length;
+  return `<button type="button" class="iconbtn" data-open-ai="1" style="width:100%;justify-content:center;margin:0 0 8px;">🤖 AI questions (${n}) — kept separate from PYQs</button>`;
+}
+document.addEventListener("click", (e)=>{
+  const b = e.target.closest("[data-cs]");
+  if(b){
+    const to = b.dataset.cs, subject = b.dataset.subject||null, topic = b.dataset.topic||null, cur = currentScreen();
+    if(to==="ai"){
+      if(cur.type==="ai-questions") return;
+      navStack[navStack.length-1] = { type:"ai-questions", subject, topic, _pyq:cur }; render();
+    } else {
+      if(cur.type!=="ai-questions") return;
+      const back = cur._pyq || (topic ? { type:"topic-detail", subject, topic } : subject ? { type:"subject-topics", subject } : null);
+      if(!back) return;
+      navStack[navStack.length-1] = back; render();
+    }
+    return;
+  }
+  const o = e.target.closest("[data-open-ai]");
+  if(o) pushScreen({ type:"ai-questions", subject:o.dataset.subject||null, topic:o.dataset.topic||null });
+});
+function aiBackLabel(){
+  const prev = navStack[navStack.length-2];
+  if(!prev) return "Back";
+  const m = { bank:"Back to Bank", topics:"Back to Topics", subjects:"Back to Subjects", stats:"Back to Stats", papers:"Back" };
+  if(m[prev.type]) return m[prev.type];
+  if(prev.type==="subject-topics") return `Back to ${prev.subject}`;
+  if(prev.type==="topic-detail") return `Back to ${prev.topic}`;
+  return "Back";
+}
+function renderAiQuestions(){
+  const screen = currentScreen();
+  const all = visibleAiQuestions();
+  const subjects = Array.from(new Set(all.map(q=>q.subject).filter(Boolean))).sort((a,b)=>a.localeCompare(b));
+  const subject = screen.subject || null;
+  const bySubj = subject ? all.filter(q=>q.subject===subject) : all;
+  const topics = Array.from(new Set(bySubj.map(q=>q.topic||FALLBACK_TOPIC))).sort((a,b)=>a.localeCompare(b));
+  const topic = (screen.topic && subject) ? screen.topic : null;
+  let qs = bySubj.filter(q=> !topic || (q.topic||FALLBACK_TOPIC)===topic);
+  if(screen.aiFlaggedOnly) qs = qs.filter(q=>q.flagged);
+  const title = topic || subject || "AI questions";
+  const label = "🤖 AI — " + (subject ? subject + (topic ? " › "+topic : "") : "all subjects");
+  const selOpts = (list, cur, allLabel)=> `<option value="">${allLabel}</option>` + list.map(x=>`<option value="${escapeHtml(x)}" ${x===cur?"selected":""}>${escapeHtml(x)}</option>`).join("");
+  const actionsHtml = `
+    ${subject ? contentSwitchHtml("ai", subject, topic) : ""}
+    <div class="chart-note" style="margin:4px 2px;">AI-generated practice questions. They are never mixed into PYQ lists, search or PYQ stats.</div>
+    <div class="filter-grid">
+      <div class="field" style="margin-bottom:6px;"><label>Subject</label><select class="ai-input" id="aiSubjSel">${selOpts(subjects, subject, "All subjects")}</select></div>
+      <div class="field" style="margin-bottom:6px;"><label>Topic</label><select class="ai-input" id="aiTopicSel" ${subject?"":"disabled"}>${selOpts(topics, topic, "All topics")}</select></div>
+    </div>
+    <div style="display:flex;gap:8px;margin:0 0 4px;">
+      <button class="iconbtn ${screen.aiFlaggedOnly?"good":""}" id="aiFlagOnlyBtn" style="flex:1;justify-content:center;">${screen.aiFlaggedOnly?"⭐ Flagged only":"☆ Flagged only"}</button>
+      <button class="iconbtn" id="aiCopyListBtn" style="flex:1;justify-content:center;">Copy list</button>
+    </div>
+    <div style="display:flex;gap:8px;margin:0 0 4px;">
+      ${(subject&&topic) ? `<button class="iconbtn" data-ai="gen-topic" data-subject="${escapeHtml(subject)}" data-topic="${escapeHtml(topic)}" style="flex:1;justify-content:center;">✨ Generate more</button>` : ""}
+      <button class="iconbtn bad" id="aiDeleteAllBtn" style="flex:1;justify-content:center;" ${qs.length===0?"disabled":""}>🗑 Delete these (${qs.length})</button>
+    </div>`;
+  renderQuestionListScreen({
+    backLabel: aiBackLabel(),
+    onBack: popScreen,
+    title,
+    meta: `🤖 ${qs.length} AI question${qs.length===1?"":"s"}${subject?` · ${subject}`:""}`,
+    questions: qs,
+    actionsHtml,
+    allowPractice: true,
+    practiceInfo: { sourceType:"ai", scopeKey:`ai:${subject||"*"}|||${topic||"*"}`, scopeLabel: label, syllabusId: getCurrentSyllabusId() },
+    bindActions: ()=>{
+      const reset = ()=>{ delete screen._pyq; };
+      document.getElementById("aiSubjSel").addEventListener("change", e=>{ screen.subject = e.target.value||null; screen.topic = null; reset(); render(); });
+      document.getElementById("aiTopicSel").addEventListener("change", e=>{ screen.topic = e.target.value||null; reset(); render(); });
+      document.getElementById("aiFlagOnlyBtn").addEventListener("click", ()=>{ screen.aiFlaggedOnly = !screen.aiFlaggedOnly; render(); });
+      document.getElementById("aiCopyListBtn").addEventListener("click", ()=> copyQuestionsToClipboard(qs, title));
+      document.getElementById("aiDeleteAllBtn").addEventListener("click", ()=>{
+        if(!qs.length) return;
+        if(!confirm(`Delete these ${qs.length} AI question${qs.length===1?"":"s"}? This can't be undone. (Your PYQs are not touched.)`)) return;
+        qs.forEach(q=> deleteQuestion(q._paperId, String(q.id)));
+        render(); toast("AI questions deleted");
+      });
+    }
+  });
+}
+function renderAiHub(){
+  const all = visibleAiQuestions();
+  const bySubj = {};
+  all.forEach(q=>{ const k = q.subject||"Unclassified"; (bySubj[k] = bySubj[k] || new Set()).add(q.topic||FALLBACK_TOPIC); });
+  const counts = {}; all.forEach(q=>{ const k = q.subject||"Unclassified"; counts[k]=(counts[k]||0)+1; });
+  const subs = Object.keys(counts).sort((a,b)=>a.localeCompare(b));
+  let html = `<div class="chart-note" style="margin:4px 2px 8px;">AI-generated questions live here, separate from your previous-year questions.</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <button class="iconbtn primary" id="aiHubAll" style="flex:1;justify-content:center;" ${all.length===0?"disabled":""}>View all (${all.length})</button>
+      <button class="iconbtn" data-ai="pdf-hub" style="flex:1;justify-content:center;">📄 From a PDF</button>
+    </div>`;
+  if(!subs.length) html += emptyState("No AI questions yet", "Open a topic and use 🤖 Generate AI questions, or add a study PDF with “📄 From a PDF”.");
+  else {
+    html += `<div id="listWrap">`;
+    subs.forEach((sub,idx)=>{
+      html += rowHtml({ num:String(idx+1).padStart(2,"0"), title:sub, sub:`${bySubj[sub].size} topic${bySubj[sub].size===1?"":"s"}`, count:`${counts[sub]} q`, dataAttr:`data-ai-subject="${escapeHtml(sub)}"` });
+    });
+    html += `</div>`;
+  }
+  return html;
+}
+function bindAiHub(){
+  const allBtn = document.getElementById("aiHubAll");
+  if(allBtn) allBtn.addEventListener("click", ()=> pushScreen({ type:"ai-questions" }));
+  document.querySelectorAll("#listWrap .row[data-ai-subject]").forEach(r=> r.addEventListener("click", ()=> pushScreen({ type:"ai-questions", subject:r.dataset.aiSubject })));
+}
+
 function renderBankRoot(){
+  const screen = currentScreen();
+  const view = screen.bankView || "banks";
+  const seg = `<div class="segmented" id="bankViewSeg" style="margin-bottom:10px;"><button data-v="banks" class="${view==="banks"?"active":""}">📦 Banks</button><button data-v="ai" class="${view==="ai"?"active":""}">🤖 AI questions</button></div>`;
+  const bindSeg = ()=> document.querySelectorAll("#bankViewSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.bankView = b.dataset.v; render(); }));
+  if(view==="ai"){
+    mainEl.innerHTML = seg + renderAiHub();
+    bindSeg(); bindAiHub();
+    return;
+  }
   const banks = DATA.banks;
-  let html = `<div style="display:flex;gap:8px;margin-bottom:10px;">
+  let html = seg + `<div style="display:flex;gap:8px;margin-bottom:10px;">
     <button class="iconbtn primary" id="newBankBtn" style="flex:1;justify-content:center;">+ New bank</button>
   </div>`;
   if(banks.length===0){
@@ -2472,6 +2615,7 @@ function renderBankRoot(){
     html += `</div>`;
   }
   mainEl.innerHTML = html;
+  bindSeg();
   document.getElementById("newBankBtn").addEventListener("click", openNewBankModal);
   document.querySelectorAll("#listWrap .row").forEach(row=>{
     row.addEventListener("click", ()=> pushScreen({ type:"bank-detail", bankId: row.dataset.bankId }));
@@ -2640,7 +2784,7 @@ function openQuestionPickerModal(bankId){
   const f = { term:"", subject:"", topic:"", paper:"", scope:"current" };
   const picked = new Set();
   const LIMIT = 200;
-  const basePool = ()=> allQuestions().filter(q=> !existingKeys.has(`${q._paperId}::${q.id}`) && (f.scope==="all" || q._syllabusId===cur));
+  const basePool = ()=> pyqAllQuestions().filter(q=> !existingKeys.has(`${q._paperId}::${q.id}`) && (f.scope==="all" || q._syllabusId===cur));
   let shown = [];
 
   modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal tall">
@@ -2806,6 +2950,7 @@ function searchScopeLabel(sc){
 function searchPool(sc){
   const cur = getCurrentSyllabusId();
   return allQuestions().filter(q=>{
+    if(isAiPaperId(q._paperId)) return false;
     if(q._syllabusId==="__bank_only__") return false;
     if(sc.mode==="all") return true;
     if(sc.mode==="pick") return sc.ids.includes(q._syllabusId);
@@ -2967,23 +3112,32 @@ function openRandomExamModal(bank){
 }
 
 /* ================= Attempts tab ================= */
+/* a test made only of AI-generated questions (new ones have type "ai"; older ones are detected by their records) */
+function isAiAttempt(a){
+  if(a.type==="ai") return true;
+  const ans = a.answers||[];
+  return ans.length>0 && ans.every(r=>isAiPaperId(r.paperId));
+}
 function renderAttemptsRoot(){
   const screen = currentScreen();
   const grouping = screen.grouping || "paper";
   const sortMode = screen.attemptsSort || "recent";
   const searchTerm = getSearch();
   const cur = getCurrentSyllabusId();
-  const attempts = (DATA.attempts||[]).filter(a=> a.type===grouping && (grouping==="bank" || a.syllabus_id===cur));
+  const attempts = (DATA.attempts||[]).filter(a=> grouping==="ai"
+    ? (isAiAttempt(a) && a.syllabus_id===cur)
+    : (a.type===grouping && (grouping==="bank" || a.syllabus_id===cur) && !isAiAttempt(a)));
 
   let html = `<div class="segmented" id="groupSeg">
     <button data-g="paper" class="${grouping==='paper'?'active':''}">Paper</button>
     <button data-g="subject" class="${grouping==='subject'?'active':''}">Subject</button>
     <button data-g="topic" class="${grouping==='topic'?'active':''}">Topic</button>
     <button data-g="bank" class="${grouping==='bank'?'active':''}">Bank</button>
+    <button data-g="ai" class="${grouping==='ai'?'active':''}">🤖 AI</button>
   </div>`;
 
   if(attempts.length===0){
-    html += emptyState("No attempts yet", grouping==="bank" ? "Create a random exam from a question bank to see attempts here." : `Start a practice test from a ${grouping} listing to see your history here.`);
+    html += emptyState("No attempts yet", grouping==="bank" ? "Create a random exam from a question bank to see attempts here." : grouping==="ai" ? "Start a practice test from the AI questions section to see your history here." : `Start a practice test from a ${grouping} listing to see your history here.`);
     mainEl.innerHTML = html;
   } else {
     const groups = {};
@@ -3046,7 +3200,7 @@ function renderAttemptsRoot(){
 }
 
 function renderAttemptsForScope(groupBy, scopeKey, scopeLabel){
-  const attempts = (DATA.attempts||[]).filter(a=>a.type===groupBy && a.scopeKey===scopeKey)
+  const attempts = (DATA.attempts||[]).filter(a=> (groupBy==="ai" ? isAiAttempt(a) : a.type===groupBy) && a.scopeKey===scopeKey)
     .sort((a,b)=> new Date(b.timestamp)-new Date(a.timestamp));
 
   let html = `<div class="detail-head">
@@ -3120,9 +3274,23 @@ const STATS_BASIS_KEY = "psev_stats_basis";
 function getStatsBasis(){ const v = localStorage.getItem(STATS_BASIS_KEY); return (v==="latest"||v==="all") ? v : "first"; }
 function setStatsBasis(v){ localStorage.setItem(STATS_BASIS_KEY, v); }
 function getStatsResetAt(){ return Number(DATA.statsResetAt)||0; }
+/* PYQ vs AI-question stats are never mixed. Everything is PYQ by default; only the Stats screens
+   (rendered through withStatsMode) use the saved toggle. */
+const STATS_MODE_KEY = "psev_stats_mode";
+function getStatsMode(){ return localStorage.getItem(STATS_MODE_KEY)==="ai" ? "ai" : "pyq"; }
+function setStatsMode(v){ localStorage.setItem(STATS_MODE_KEY, v==="ai"?"ai":"pyq"); }
+let _forcedStatsMode = null;
+function effStatsMode(){ return _forcedStatsMode || "pyq"; }
+function withStatsMode(mode, fn){ const prev = _forcedStatsMode; _forcedStatsMode = mode; try{ return fn(); } finally{ _forcedStatsMode = prev; } }
+function statsQuestions(){ return effStatsMode()==="ai" ? visibleAiQuestions() : visibleQuestions(); }
+function attemptInMode(a, wantAi){
+  const ans = a.answers||[];
+  if(!ans.length) return (a.type==="ai") === wantAi;
+  return ans.some(r=> isAiPaperId(r.paperId) === wantAi);
+}
 function statsAttempts(){
-  const cur = getCurrentSyllabusId(), base = getStatsResetAt();
-  return (DATA.attempts||[]).filter(a=> (a.type==="bank" || a.syllabus_id===cur) && new Date(a.timestamp).getTime()>=base);
+  const cur = getCurrentSyllabusId(), base = getStatsResetAt(), wantAi = effStatsMode()==="ai";
+  return (DATA.attempts||[]).filter(a=> (a.type==="bank" || a.syllabus_id===cur) && new Date(a.timestamp).getTime()>=base && attemptInMode(a, wantAi));
 }
 const isAnsweredGraded = r=> !!r.isGraded && r.selectedIndex!==null && r.selectedIndex!==undefined;
 const hasTimeRec = r=> r.timeMs>0;
@@ -3167,12 +3335,12 @@ function computeAccuracyByTopic(){
 }
 function computeQuestionCountsBySubject(){
   const counts = {};
-  visibleQuestions().forEach(q=>{ counts[q.subject]=(counts[q.subject]||0)+1; });
+  statsQuestions().forEach(q=>{ counts[q.subject]=(counts[q.subject]||0)+1; });
   return counts;
 }
 function computeQuestionCountsByTopic(){
   const counts = {};
-  visibleQuestions().forEach(q=>{ const key=`${q.subject}|||${q.topic||FALLBACK_TOPIC}`; counts[key]=(counts[key]||0)+1; });
+  statsQuestions().forEach(q=>{ const key=`${q.subject}|||${q.topic||FALLBACK_TOPIC}`; counts[key]=(counts[key]||0)+1; });
   return counts;
 }
 function computePriorityList(){
@@ -3240,7 +3408,7 @@ function collectWrongQuestions(){
   (DATA.attempts||[]).filter(a=> a.type==="bank" || a.syllabus_id===cur).forEach(a=>{
     const ts = new Date(a.timestamp).getTime();
     a.answers.forEach(rec=>{
-      if(!rec.isGraded) return;
+      if(!rec.isGraded || isAiPaperId(rec.paperId)) return;
       const key = `${rec.paperId}::${rec.qid}`;
       if(!latestByKey[key] || latestByKey[key].ts < ts) latestByKey[key] = { ts, rec };
     });
@@ -3279,6 +3447,8 @@ function bindStatsQuickActions(){
   if(weakBtn) weakBtn.addEventListener("click", openWeakAreaBankModal);
   const mockBtn = document.getElementById("mockExamBtn");
   if(mockBtn) mockBtn.addEventListener("click", openMockExamModal);
+  const aiOpen = document.getElementById("aiOpenBtn");
+  if(aiOpen) aiOpen.addEventListener("click", ()=> pushScreen({ type:"ai-questions" }));
 }
 
 /* ================= Stats (sub-tabbed) ================= */
@@ -3288,8 +3458,10 @@ const STATS_TABS = [
 function collectAttemptRecords(){
   const idx = buildQuestionIndex();
   const out = [];
+  const wantAi = effStatsMode()==="ai";
   statsAttempts().slice().sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp)).forEach(a=>{
     (a.answers||[]).forEach(rec=>{
+      if(isAiPaperId(rec.paperId) !== wantAi) return;
       const q = idx[`${rec.paperId}::${rec.qid}`];
       out.push(Object.assign({}, rec, { ts: new Date(a.timestamp).getTime(), attemptId:a.id, difficulty: rec.difficulty || (q && q.difficulty) || null }));
     });
@@ -3328,6 +3500,27 @@ function statsOverviewHtml(attempts){
   const totalGraded = basisRecs.length, totalCorrect = basisRecs.filter(r=>r.isCorrect).length;
   const overallPct = totalGraded? Math.round(100*totalCorrect/totalGraded) : null;
   const { streak, today } = computeStreak();
+  const aiMode = effStatsMode()==="ai";
+  if(aiMode){
+    const nAi = visibleAiQuestions().length;
+    let h = `<div class="stat-cards">
+      <div class="stat-card"><div class="num">${totalAttempts}</div><div class="label">AI tests taken</div></div>
+      <div class="stat-card"><div class="num">${overallPct===null?"—":overallPct+"%"}</div><div class="label">Accuracy</div></div>
+      <div class="stat-card"><div class="num">${nAi}</div><div class="label">AI questions</div></div>
+    </div>
+    <div class="chart-note" style="margin:6px 2px 10px;">These numbers come only from AI-generated questions. They are kept apart from your PYQ stats, plans and review queues.</div>
+    <div class="chart-block"><button class="iconbtn primary" id="aiOpenBtn" style="width:100%;justify-content:center;">🤖 Open AI questions</button></div>`;
+    if(totalAttempts===0){ h += emptyState("No AI tests yet", "Open the AI questions section and start a practice test to see AI-question stats here."); return h; }
+    const recentAi = [...attempts].sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp)).slice(-10);
+    h += `<div class="chart-block"><div class="chart-title">Recent AI test scores</div>`;
+    recentAi.forEach(a=>{
+      const pct = a.totalCount? Math.round(100*a.correctCount/a.totalCount):0;
+      const color = pct>=70? "var(--good)" : pct>=40? "var(--gold)" : "var(--bad)";
+      h += `<div class="bar-row"><div class="bar-label">${escapeHtml(new Date(a.timestamp).toLocaleDateString())}</div><div class="bar-track"><div class="bar-fill" style="width:${Math.max(2,pct)}%;background:${color};"></div></div><div class="bar-val">${pct}%</div></div>`;
+    });
+    h += `</div>`;
+    return h;
+  }
   const wrongQs = collectWrongQuestions();
   const flaggedQs = collectFlaggedQuestions();
   let html = `<div class="stat-cards">
@@ -3384,7 +3577,7 @@ function statsSubjectsHtml(screen){
   const sortMode = screen.statsSort || "weak";
   const subjAccMap = computeAccuracyBySubject();
   const subjCounts = computeQuestionCountsBySubject();
-  const qs = visibleQuestions();
+  const qs = statsQuestions();
   let subjRows = Object.keys(subjCounts).map(s=>{
     const acc = subjAccMap[s];
     const practiced = !!acc && acc.total>0;
@@ -3443,7 +3636,7 @@ function statsTimeHtml(recs){
 
 function statsDifficultyHtml(recs){
   if(!isDifficultyMarkingEnabled()) return `<div class="chart-note" style="margin:14px 2px;">Difficulty marking is switched off. Turn it on from ⚙️ below to mark and analyse question difficulty.</div>`;
-  const qs = visibleQuestions();
+  const qs = statsQuestions();
   const overall = avgDifficulty(qs);
   let html = `<div class="chart-note">Easy = 3, Medium = 6, Difficult = 9. Averages count only questions you have marked, shown as “n/total marked”.</div>`;
   html += `<div class="stat-cards">
@@ -3479,7 +3672,7 @@ function guessSummary(arr, mk){
 function statsGuessHtml(recs, screen){
   const mk = currentMarking();
   const all = guessSummary(recs, mk);
-  let html = `<button class="iconbtn" data-ai="guess-coach" style="width:100%;justify-content:center;margin-bottom:10px;">🎓 AI guess coach</button><div class="chart-block"><div class="chart-title">How guessing pays off</div>
+  let html = `${effStatsMode()==="ai"?"":`<button class="iconbtn" data-ai="guess-coach" style="width:100%;justify-content:center;margin-bottom:10px;">🎓 AI guess coach</button>`}<div class="chart-block"><div class="chart-title">How guessing pays off</div>
     <div class="chart-note">Marking: +${mk.pos} right, −${Math.round(mk.pen*100)/100} wrong. Break-even accuracy = penalty ÷ (mark + penalty) = <b>${Math.round(mk.breakEven*1000)/10}%</b>. Guess only when your chance of being right is above this; below it, guessing loses marks on average.</div></div>`;
   if(!all.n) return html + `<div class="chart-note" style="margin:14px 2px;">Tap “🤔 Guess” on a question during a test to start collecting guess data.</div>`;
   const marks = r=> (r>0?"+":"")+r;
@@ -3579,7 +3772,9 @@ function renderStatsScreen(){
   const attempts = statsAttempts();
   const allRecs = collectAttemptRecords();
   const answeredRecs = pickByBasis(allRecs, isAnsweredGraded);
-  let html = `<div class="detail-head"><div style="width:100%"><h2>Performance</h2><div class="meta">${escapeHtml(getSyllabusById(cur).name)} syllabus</div></div></div>`;
+  const sm = effStatsMode();
+  let html = `<div class="detail-head"><div style="width:100%"><h2>Performance</h2><div class="meta">${escapeHtml(getSyllabusById(cur).name)} syllabus · ${sm==="ai"?"🤖 AI-question stats":"📚 PYQ stats"}</div></div></div>`;
+  html += `<div class="segmented" id="modeSeg"><button data-m="pyq" class="${sm==="pyq"?"active":""}">📚 PYQ stats</button><button data-m="ai" class="${sm==="ai"?"active":""}">🤖 AI-question stats</button></div>`;
   html += statsTabBarHtml(tab);
   html += statsBasisBlockHtml();
   if(tab==="overview") html += statsOverviewHtml(attempts);
@@ -3592,6 +3787,7 @@ function renderStatsScreen(){
   html += `<div class="chart-block" style="margin-top:18px;"><label class="switch-row"><input type="checkbox" id="diffSwitch" ${on?"checked":""}> ⚙️ Allow difficulty marking (E / M / D) on questions</label></div>
     <button class="iconbtn bad" id="resetStatsBtn" style="width:100%;justify-content:center;margin-top:10px;">🧹 Start fresh stats…</button>`;
   mainEl.innerHTML = html;
+  document.querySelectorAll("#modeSeg button").forEach(b=> b.addEventListener("click", ()=>{ setStatsMode(b.dataset.m); render(); }));
   document.querySelectorAll("#basisSeg button").forEach(b=> b.addEventListener("click", ()=>{ setStatsBasis(b.dataset.b); render(); }));
   document.getElementById("resetStatsBtn").addEventListener("click", openResetStatsModal);
   document.querySelectorAll("#statsTabSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.statsTab = b.dataset.t; render(); }));
@@ -3619,7 +3815,7 @@ function renderStatsAllTopics(){
   const sortMode = screen.statsSortAll || "weak";
   const topicAccMap = computeAccuracyByTopic();
   const topicCounts = computeQuestionCountsByTopic();
-  const qs = visibleQuestions();
+  const qs = statsQuestions();
   let rows = Object.keys(topicCounts).map(k=>{
     const [subject, topic] = k.split("|||");
     const acc = topicAccMap[k];
@@ -3649,7 +3845,7 @@ function renderStatsAllTopics(){
   mainEl.innerHTML = html + `</div>`;
   document.getElementById("backBtn").addEventListener("click", popScreen);
   document.querySelectorAll("#allSortSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.statsSortAll=b.dataset.s; render(); }));
-  document.querySelectorAll("[data-topic]").forEach(row=> row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject:row.dataset.subj, topic:row.dataset.topic })));
+  document.querySelectorAll("[data-topic]").forEach(row=> row.addEventListener("click", ()=> pushScreen({ type: getStatsMode()==="ai" ? "ai-questions" : "topic-detail", subject:row.dataset.subj, topic:row.dataset.topic })));
 }
 
 function renderStatsSubject(subject){
@@ -3707,7 +3903,7 @@ function renderStatsSubject(subject){
     btn.addEventListener("click", ()=>{ screen.statsSort2 = btn.dataset.s; render(); });
   });
   document.querySelectorAll("[data-stats-topic]").forEach(row=>{
-    row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject, topic: row.dataset.statsTopic }));
+    row.addEventListener("click", ()=> pushScreen({ type: getStatsMode()==="ai" ? "ai-questions" : "topic-detail", subject, topic: row.dataset.statsTopic }));
   });
 }
 
@@ -4346,7 +4542,7 @@ function normalizeQuestionText(t){
 function findDuplicateQuestions(newQuestions, excludePaperId){
   const existingMap = {};
   DATA.papers.forEach(p=>{
-    if(p.id===excludePaperId) return;
+    if(p.id===excludePaperId || isAiPaper(p)) return;
     (p.questions||[]).forEach(q=>{
       const norm = normalizeQuestionText(q.question_text);
       if(norm.length<10) return; // too short to be a meaningful match

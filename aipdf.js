@@ -391,9 +391,11 @@ function openPdfLibraryForCurrentListing(){
   const ctx = { key:info.key, label:info.label, subject:null, topic:null };
   if(scr.type==="topic-detail"){ ctx.subject = scr.subject; ctx.topic = scr.topic; }
   else if(scr.type==="subject-topics" || scr.type==="subject-all"){ ctx.subject = scr.subject; }
+  else if(scr.type==="ai-questions"){ ctx.subject = scr.subject||null; ctx.topic = scr.topic||null; }
   openPdfLibrary(ctx);
 }
 window.openPdfLibraryForCurrentListing = openPdfLibraryForCurrentListing;
+window.openPdfLibraryHub = function(){ openPdfLibrary({ key:"ai:*|||*", label:"AI questions (all)", subject:null, topic:null }); };
 
 async function openPdfLibrary(ctx){
   CTX = ctx || CTX;
@@ -642,10 +644,10 @@ function openPdfReview(st){
     ${x.explanation?`<div class="chart-note">${renderRichText(x.explanation)}</div>`:""}</div>`).join("");
   const dropped = tot.badQuote + tot.badShape;
   aiModal(`<h3>Review questions from PDF</h3>
-    <div class="chart-note">${items.length} question${items.length===1?"":"s"} kept${dropped?`, ${dropped} dropped automatically${tot.badQuote?` (${tot.badQuote} quoted a line that is not in the PDF)`:""}`:""}. Ticked ones passed every check; unticked ones need your eye. Open “Source line” to verify.${abortMsg?`<br>⚠ Stopped early: ${esc(abortMsg.slice(0,200))}`:""}</div>
+    <div class="chart-note">${items.length} question${items.length===1?"":"s"} kept${dropped?`, ${dropped} dropped automatically${tot.badQuote?` (${tot.badQuote} quoted a line that is not in the PDF)`:""}`:""}. They are saved in the separate AI questions section, never with PYQs. Ticked ones passed every check; unticked ones need your eye. Open “Source line” to verify.${abortMsg?`<br>⚠ Stopped early: ${esc(abortMsg.slice(0,200))}`:""}</div>
     <div style="max-height:50vh;overflow-y:auto;">${rows}</div>
     <div class="row-btns"><button class="iconbtn" id="rvBack" style="flex:1;justify-content:center;">Discard</button>
-      <button class="iconbtn primary" id="rvAdd" style="flex:1;justify-content:center;">Add to "AI Practice"</button></div>`);
+      <button class="iconbtn primary" id="rvAdd" style="flex:1;justify-content:center;">Add to AI questions</button></div>`);
   typesetMath(modalRoot);
   document.getElementById("rvBack").addEventListener("click", closeModal);
   document.getElementById("rvAdd").addEventListener("click", ()=>{
@@ -665,7 +667,7 @@ function openPdfReview(st){
       paper.questions.push(q);
     });
     saveData(DATA); closeModal(); render();
-    toast(`${picked.length} question${picked.length===1?"":"s"} added to “AI Practice Questions”`);
+    toast(`${picked.length} question${picked.length===1?"":"s"} added to AI questions (Bank tab → 🤖 AI questions)`);
   });
 }
 

@@ -389,10 +389,10 @@ function openAIGeneratedReview(subject, topic, items){
     ${x.explanation?`<div class="chart-note">${renderRichText(x.explanation)}</div>`:""}</div>`).join("");
   aiModal(`
     <h3>Review generated questions</h3>
-    <div class="chart-note">AI-written — check the highlighted answers before relying on them. Untick any you don't want.</div>
+    <div class="chart-note">AI-written — check the highlighted answers before relying on them. They are saved in the separate AI questions section, not with your PYQs. Untick any you don't want.</div>
     <div style="max-height:52vh;overflow-y:auto;">${rows}</div>
     <div class="row-btns"><button class="iconbtn" id="aiClose" style="flex:1;justify-content:center;">Discard</button>
-      <button class="iconbtn primary" id="genAdd" style="flex:1;justify-content:center;">Add to "AI Practice"</button></div>`);
+      <button class="iconbtn primary" id="genAdd" style="flex:1;justify-content:center;">Add to AI questions</button></div>`);
   typesetMath(modalRoot);
   document.getElementById("aiClose").addEventListener("click", closeModal);
   document.getElementById("genAdd").addEventListener("click", ()=>{
@@ -411,7 +411,7 @@ function openAIGeneratedReview(subject, topic, items){
       paper.questions.push(q);
     });
     saveData(DATA); closeModal(); render();
-    toast(`${picked.length} question${picked.length===1?"":"s"} added to “AI Practice Questions”`);
+    toast(`${picked.length} question${picked.length===1?"":"s"} added to AI questions (Bank tab → 🤖 AI questions)`);
   });
 }
 
@@ -532,6 +532,9 @@ document.addEventListener("click", (e)=>{
   } else if(act==="gen-topic"){
     if(!aiLoad().presets.length) return aiNeedSetup();
     openAIGenerateModal(el.dataset.subject, el.dataset.topic, null);
+  } else if(act==="pdf-hub"){
+    if(!aiLoad().presets.length) return aiNeedSetup();
+    if(typeof openPdfLibraryHub==="function") openPdfLibraryHub();
   } else if(act==="pdf"){
     if(!aiLoad().presets.length) return aiNeedSetup();
     if(typeof openPdfLibraryForCurrentListing==="function") openPdfLibraryForCurrentListing();
