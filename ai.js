@@ -33,7 +33,7 @@ function aiUpdateBtnLabel(){
 }
 
 /* ---------- low-level request ---------- */
-async function aiRequest(preset, system, user, maxTokens){
+async function aiRequest(preset, system, user, maxTokens, images){
   if(!preset.apiKey) throw Object.assign(new Error("No API key"), {status:401});
   if(!preset.model) throw Object.assign(new Error("No model name set"), {status:400});
   const ctrl = new AbortController();
@@ -43,11 +43,13 @@ async function aiRequest(preset, system, user, maxTokens){
   if(preset.format==="anthropic"){
     url = base + "/v1/messages";
     headers = { "content-type":"application/json", "x-api-key":preset.apiKey, "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" };
-    body = { model:preset.model, max_tokens:maxTokens||2500, system, messages:[{role:"user",content:user}] };
+    const ucontent = (images&&images.length) ? images.map(u=>{ const m=/^data:([^;]+);base64,(.*)$/.exec(u)||[]; return {type:"image", source:{type:"base64", media_type:m[1]||"image/jpeg", data:m[2]||""}}; }).concat([{type:"text", text:user}]) : user;
+    body = { model:preset.model, max_tokens:maxTokens||2500, system, messages:[{role:"user",content:ucontent}] };
   } else {
     url = base + "/chat/completions";
     headers = { "content-type":"application/json", "authorization":"Bearer "+preset.apiKey };
-    body = { model:preset.model, max_tokens:maxTokens||2500, temperature:0.4, messages:[{role:"system",content:system},{role:"user",content:user}] };
+    const ucontent = (images&&images.length) ? [{type:"text", text:user}].concat(images.map(u=>({type:"image_url", image_url:{url:u}}))) : user;
+    body = { model:preset.model, max_tokens:maxTokens||2500, temperature:(images&&images.length)?0:0.4, messages:[{role:"system",content:system},{role:"user",content:ucontent}] };
     if(/openrouter\.ai/i.test(base)) body.reasoning = { exclude:true };
   }
   let res;
@@ -75,7 +77,7 @@ async function aiRequest(preset, system, user, maxTokens){
     /* reasoning models can spend the whole token budget on thinking and return nothing: retry once with a bigger budget */
     if(!aiRequest._retry && (maxTokens||2500) < 6000){
       aiRequest._retry = true;
-      try{ return await aiRequest(preset, system, user, Math.min(8000, Math.max(1500, (maxTokens||2500)*4))); }
+      try{ return await aiRequest(preset, system, user, Math.min(8000, Math.max(1500, (maxTokens||2500)*4)), images); }
       finally{ aiRequest._retry = false; }
     }
     const fr = data && data.choices && data.choices[0] && data.choices[0].finish_reason;
@@ -85,7 +87,7 @@ async function aiRequest(preset, system, user, maxTokens){
 }
 
 /* ---------- ask with automatic preset fallback ---------- */
-async function aiAsk(system, user, maxTokens){
+async function aiAsk(system, user, maxTokens, images){
   let st = aiLoad();
   if(!st.presets.length) throw Object.assign(new Error("NO_PRESET"), {noPreset:true});
   const start = Math.max(0, st.presets.findIndex(p=>p.id===st.activeId));
@@ -95,14 +97,19 @@ async function aiAsk(system, user, maxTokens){
     const fresh = order.filter(p=> !p.limitHitAt || Date.now()-p.limitHitAt > 3600000);
     if(fresh.length) order = fresh.concat(order.filter(p=>!fresh.includes(p)));
   }
+  if(images && images.length){
+    /* image requests: try presets that are most likely to accept images first (Gemini, OpenAI, Anthropic, OpenRouter) */
+    const vscore = p => /generativelanguage|googleapis/i.test(p.baseUrl||"")?0 : p.format==="anthropic"?1 : /openai\.com/i.test(p.baseUrl||"")?1 : /openrouter/i.test(p.baseUrl||"")?2 : 3;
+    order = order.map((p,i)=>({p,i})).sort((a,b)=>vscore(a.p)-vscore(b.p)||a.i-b.i).map(x=>x.p);
+  }
   const errors = [];
   for(const p of order){
     try{
       let text;
-      try{ text = await aiRequest(p, system, user, maxTokens); }
+      try{ text = await aiRequest(p, system, user, maxTokens, images); }
       catch(e1){
         /* provider briefly overloaded (503 etc.): wait a few seconds and retry once before moving on */
-        if(e1 && e1.busy){ await new Promise(r=>setTimeout(r,3500)); text = await aiRequest(p, system, user, maxTokens); }
+        if(e1 && e1.busy){ await new Promise(r=>setTimeout(r,3500)); text = await aiRequest(p, system, user, maxTokens, images); }
         else throw e1;
       }
       st = aiLoad();
@@ -525,6 +532,9 @@ document.addEventListener("click", (e)=>{
   } else if(act==="gen-topic"){
     if(!aiLoad().presets.length) return aiNeedSetup();
     openAIGenerateModal(el.dataset.subject, el.dataset.topic, null);
+  } else if(act==="pdf"){
+    if(!aiLoad().presets.length) return aiNeedSetup();
+    if(typeof openPdfLibraryForCurrentListing==="function") openPdfLibraryForCurrentListing();
   } else if(act==="plan"){
     if(!aiLoad().presets.length) return aiNeedSetup();
     openAIPlanModal();

@@ -794,7 +794,8 @@ function listingNoteBlockHtml(screen){
   const info = listingInfo(screen); if(!info) return "";
   const n = getListingNote(info.key);
   return `<div class="listing-note-wrap"><button class="iconbtn ${n?"has-note":""}" data-listing-note="1" style="width:100%;justify-content:center;">📝 My note${n?" ✓":""} for this listing</button>
-    ${n?`<div class="listing-note">${renderRichText(n.text)}</div>`:""}</div>`;
+    ${n?`<div class="listing-note">${renderRichText(n.text)}</div>`:""}
+    <button class="iconbtn" data-ai="pdf" style="width:100%;justify-content:center;margin-top:6px;">📄 Study PDFs → AI questions</button></div>`;
 }
 function openListingNoteModal(info){
   const n = getListingNote(info.key);

@@ -531,3 +531,10 @@ main{flex:1;padding:14px 16px 90px;}
 .preview-card{background:var(--paper);color:var(--text-on-paper);border-radius:10px;padding:16px;width:100%;max-width:560px;max-height:84vh;overflow-y:auto;box-shadow:0 12px 40px #000a;}
 .preview-meta{font-size:0.76rem;color:var(--text-dim-on-paper);}
 .preview-card .explanation-block{background:var(--paper-dim);}
+
+/* ---- Study PDFs (aipdf.js) ---- */
+.pdf-row{margin-bottom:10px;}
+.pdf-badge{display:inline-block;font-size:0.72rem;padding:2px 8px;border-radius:999px;margin:0 4px 4px 0;background:#2a2f40;color:var(--text-dim-on-ink);}
+.pdf-badge.ok{background:#1e3a2a;color:#8fe3a8;}
+.pdf-badge.warn{background:#3d3420;color:#f0d28a;}
+.pdf-badge.bad{background:#3a1e22;color:#f0a3ab;}

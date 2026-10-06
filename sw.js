@@ -1,10 +1,11 @@
-const CACHE_NAME = "psc-exam-vault-v7";
+const CACHE_NAME = "psc-exam-vault-v8";
 const ASSETS = [
   "./",
   "./index.html",
   "./style.css",
   "./app.js",
   "./ai.js",
+  "./aipdf.js",
   "./taxonomy.js",
   "./manifest.json",
   "./icon.svg"
