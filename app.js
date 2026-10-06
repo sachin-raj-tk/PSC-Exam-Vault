@@ -17,6 +17,7 @@ function loadData(){
   if(!Array.isArray(parsed.paperTemplates)) parsed.paperTemplates = [];
   if(!Array.isArray(parsed.topicLists)) parsed.topicLists = [];
   if(!parsed.topicLabels || typeof parsed.topicLabels !== "object") parsed.topicLabels = {};
+  if(!parsed.listingNotes || typeof parsed.listingNotes !== "object") parsed.listingNotes = {};
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
   migrateStudyProgress(parsed.studyProgress);
   if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};
@@ -275,8 +276,32 @@ function setDifficulty(paperId, qid, level){
   const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
   if(!q) return null;
   q.difficulty = (q.difficulty===level) ? undefined : level;
+  q.difficulty_manual = true;      // a manual choice (even clearing) always beats auto-marking
+  delete q.difficulty_auto;
   saveData(DATA);
   return q.difficulty;
+}
+/* Auto-difficulty from time taken: >50s = Difficult, 26-50s = Medium, <26s = Easy.
+   Only applied to answered questions that have no difficulty yet and were never set by hand. */
+function autoDifficultyFromMs(ms){
+  const sec = ms/1000;
+  return sec>50 ? "D" : sec>=26 ? "M" : "E";
+}
+function maybeAutoDifficulty(screen, q){
+  if(!q || !isDifficultyMarkingEnabled()) return;
+  const key = `${q._paperId}::${q.id}`;
+  if(!screen.answers || screen.answers[key]===undefined) return;
+  const ms = (screen.timeSpent||{})[key];
+  if(!ms || ms<=0) return;
+  const real = aiFindQuestionSafe(q._paperId, q.id);
+  if(!real || real.difficulty || real.difficulty_manual) return;
+  real.difficulty = autoDifficultyFromMs(ms);
+  real.difficulty_auto = true;
+  saveData(DATA);
+}
+function aiFindQuestionSafe(paperId, qid){
+  const paper = DATA.papers.find(p=>p.id===paperId);
+  return paper ? (paper.questions||[]).find(x=>String(x.id)===String(qid)) : null;
 }
 function diffSuffix(questions){
   if(!isDifficultyMarkingEnabled()) return "";
@@ -535,9 +560,8 @@ function render(){
     case "stats-subject": renderStatsSubject(screen.subject); break;
     case "stats-all-topics": renderStatsAllTopics(); break;
     case "flagged-list": renderFlaggedList(); break;
+    case "search-results": renderSearchResults(screen); break;
     case "notes": renderNotesRoot(); break;
-    case "topic-lists": renderTopicListsRoot(); break;
-    case "topic-list-detail": renderTopicListDetail(screen.listId); break;
     case "paper-detail": renderPaperDetail(screen.paperId); break;
     case "subject-topics": renderSubjectTopicsList(screen.subject); break;
     case "subject-all": renderSubjectAllQuestions(screen.subject); break;
@@ -551,7 +575,7 @@ function render(){
   updateTopbarVisibility();
   typesetMath(mainEl);
 }
-const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","practice","attempt-review","flagged-list"]);
+const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","practice","attempt-review","flagged-list","search-results"]);
 function updateTopbarVisibility(){
   const screen = currentScreen();
   const isRoot = navStack.length===1;
@@ -663,69 +687,250 @@ function renderSubjectsList(){
   bindSearchInput(renderSubjectsList);
 }
 
-/* ================= Topics list (global within syllabus, sorted by frequency) ================= */
+/* ---- Long-press helper (opens its action ~150ms after release so the lift-click can't hit the new modal) ---- */
+function bindLongPress(selector, handler){
+  document.querySelectorAll(selector).forEach(el=>{
+    let timer=null, sx=0, sy=0, armed=false;
+    const start=(x,y)=>{
+      sx=x; sy=y; armed=false; clearTimeout(timer);
+      timer=setTimeout(()=>{ timer=null; armed=true; el._lp=true; el.classList.add("lp-armed"); if(navigator.vibrate){ try{ navigator.vibrate(15); }catch(e){} } }, 480);
+    };
+    const cancel=()=>{ clearTimeout(timer); timer=null; armed=false; el.classList.remove("lp-armed"); };
+    const release=()=>{
+      clearTimeout(timer); timer=null;
+      el.classList.remove("lp-armed");
+      if(armed){ armed=false; setTimeout(()=>{ el._lp=false; }, 400); setTimeout(()=>handler(el), 150); }
+    };
+    el.addEventListener("touchstart", e=>{ const t=e.touches[0]; start(t.clientX,t.clientY); }, {passive:true});
+    el.addEventListener("touchmove", e=>{ const t=e.touches[0]; if(Math.abs(t.clientX-sx)>10||Math.abs(t.clientY-sy)>10) cancel(); }, {passive:true});
+    el.addEventListener("touchend", release); el.addEventListener("touchcancel", cancel);
+    el.addEventListener("mousedown", e=>start(e.clientX,e.clientY));
+    el.addEventListener("mouseup", release); el.addEventListener("mouseleave", cancel);
+    el.addEventListener("contextmenu", e=>e.preventDefault());
+    el.addEventListener("click", e=>{ if(el._lp){ e.stopImmediatePropagation(); e.preventDefault(); } }, true);
+  });
+}
+
+/* ---- Topic quick actions (long-press): add to list / add label ---- */
+function openTopicActionsModal(subject, topic, removeFromListId){
+  const lbl = getTopicLabel(subject, topic);
+  modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal">
+    <h3>${escapeHtml(topic)}</h3>
+    <div class="meta" style="margin-bottom:12px;">${escapeHtml(subject)}</div>
+    <div class="ai-grid" style="grid-template-columns:1fr;">
+      <button class="iconbtn" id="taList" style="justify-content:center;">📌 Add to a topic list</button>
+      <button class="iconbtn" id="taLabel" style="justify-content:center;">🏷️ ${lbl?"Change label ("+escapeHtml(lbl.name)+")":"Add a label"}</button>
+      ${removeFromListId ? `<button class="iconbtn bad" id="taRemove" style="justify-content:center;">✕ Remove from this list</button>` : ""}
+      <button class="iconbtn" id="taOpen" style="justify-content:center;">Open topic</button>
+    </div>
+    <div class="row-btns"><button class="iconbtn" id="taClose" style="flex:1;justify-content:center;">Cancel</button></div>
+  </div></div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("taClose").addEventListener("click", closeModal);
+  document.getElementById("taList").addEventListener("click", ()=> openAddToListModal(subject, topic));
+  document.getElementById("taLabel").addEventListener("click", ()=> openTopicLabelModal(subject, topic));
+  document.getElementById("taOpen").addEventListener("click", ()=>{ closeModal(); pushScreen({ type:"topic-detail", subject, topic }); });
+  const rm = document.getElementById("taRemove");
+  if(rm) rm.addEventListener("click", ()=>{ removeTopicFromList(removeFromListId, subject, topic); closeModal(); render(); toast("Removed from list"); });
+}
+function openAddToListModal(subject, topic){
+  function draw(){
+    const lists = DATA.topicLists||[];
+    modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal">
+      <h3>Add to which list?</h3>
+      <div class="meta" style="margin-bottom:10px;">${escapeHtml(topic)} · ${escapeHtml(subject)}</div>
+      <div style="max-height:44vh;overflow-y:auto;">
+      ${lists.map(l=>{ const inIt = l.items.some(it=>it.subject===subject && it.topic===topic);
+        return `<button type="button" class="check-item ${inIt?"checked":""}" data-lid="${escapeHtml(l.id)}"><span style="flex:1;"><div>${escapeHtml(l.name)}</div><div class="ci-sub">${l.items.length} topic${l.items.length===1?"":"s"}</div></span><span>${inIt?"✓ Added":"+"}</span></button>`; }).join("") || `<div class="meta">No lists yet — create one below.</div>`}
+      </div>
+      <div class="field" style="margin-top:12px;"><input class="ai-input" id="newListName" placeholder="New list name…"><button class="iconbtn" id="newListAdd" style="width:100%;justify-content:center;margin-top:6px;">+ Create list and add</button></div>
+      <div class="row-btns"><button class="iconbtn primary" id="alDone" style="flex:1;justify-content:center;">Done</button></div>
+    </div></div>`;
+    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop"){ closeModal(); render(); } });
+    document.getElementById("alDone").addEventListener("click", ()=>{ closeModal(); render(); });
+    document.querySelectorAll("[data-lid]").forEach(b=> b.addEventListener("click", ()=>{
+      const l = findTopicList(b.dataset.lid); if(!l) return;
+      if(l.items.some(it=>it.subject===subject && it.topic===topic)) removeTopicFromList(l.id, subject, topic);
+      else addTopicToList(l.id, subject, topic);
+      draw();
+    }));
+    document.getElementById("newListAdd").addEventListener("click", ()=>{
+      const name = document.getElementById("newListName").value.trim(); if(!name) return;
+      const list = { id: slugify(name)+"-"+Date.now().toString(36), name, items: [] };
+      DATA.topicLists.push(list); saveData(DATA);
+      addTopicToList(list.id, subject, topic); draw();
+    });
+  }
+  draw();
+}
+
+/* ---- Per-listing notes (one note per listing) ---- */
+function listingInfo(screen){
+  if(!screen) return null;
+  switch(screen.type){
+    case "paper-detail": { const p = DATA.papers.find(x=>x.id===screen.paperId); return { key:"paper:"+screen.paperId, label:"Exam: "+(p?p.name:screen.paperId), nav:{ type:"paper-detail", paperId:screen.paperId } }; }
+    case "subject-topics": case "subject-all": return { key:"subject:"+screen.subject, label:"Subject: "+screen.subject, nav:{ type:"subject-topics", subject:screen.subject } };
+    case "topic-detail": return { key:"topic:"+screen.subject+"|||"+screen.topic, label:"Topic: "+screen.topic+" ("+screen.subject+")", nav:{ type:"topic-detail", subject:screen.subject, topic:screen.topic } };
+    case "bank-detail": { const b=(DATA.banks||[]).find(x=>x.id===screen.bankId); return { key:"bank:"+screen.bankId, label:"Bank: "+(b?b.name:screen.bankId), nav:{ type:"bank-detail", bankId:screen.bankId } }; }
+    case "flagged-list": return { key:"flagged", label:"Flagged questions", nav:{ type:"flagged-list" } };
+    case "topics": if(screen.topicListSort==="lists" && screen.activeListId){ const l=findTopicList(screen.activeListId); if(l) return { key:"list:"+l.id, label:"Topic list: "+l.name, nav:{ type:"topics", topicListSort:"lists", activeListId:l.id } }; } return null;
+    default: return null;
+  }
+}
+function getListingNote(key){ const n = (DATA.listingNotes||{})[key]; return n && n.text ? n : null; }
+function saveListingNote(info, text){
+  if(!DATA.listingNotes) DATA.listingNotes = {};
+  if(!text.trim()){ delete DATA.listingNotes[info.key]; }
+  else DATA.listingNotes[info.key] = { text: text.trim(), label: info.label, nav: info.nav||null, updatedAt: Date.now() };
+  saveData(DATA);
+}
+function appendToListingNote(text){
+  const info = listingInfo(currentScreen()) || { key:"misc:ai", label:"AI notes & tricks", nav:null };
+  const cur = getListingNote(info.key);
+  saveListingNote(info, (cur?cur.text+"\n\n":"")+text);
+  return info;
+}
+function listingNoteBlockHtml(screen){
+  const info = listingInfo(screen); if(!info) return "";
+  const n = getListingNote(info.key);
+  return `<div class="listing-note-wrap"><button class="iconbtn ${n?"has-note":""}" data-listing-note="1" style="width:100%;justify-content:center;">📝 My note${n?" ✓":""} for this listing</button>
+    ${n?`<div class="listing-note">${renderRichText(n.text)}</div>`:""}</div>`;
+}
+function openListingNoteModal(info){
+  const n = getListingNote(info.key);
+  modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal">
+    <h3>My note</h3><div class="meta" style="margin-bottom:8px;">${escapeHtml(info.label)}</div>
+    <div class="field"><textarea id="lnText" class="prose" placeholder="Anything you want to remember about this listing…" style="min-height:160px;">${escapeHtml(n?n.text:"")}</textarea></div>
+    <div class="row-btns"><button class="iconbtn" id="lnCancel" style="flex:1;justify-content:center;">Cancel</button>
+      <button class="iconbtn primary" id="lnSave" style="flex:1;justify-content:center;">Save</button></div>
+  </div></div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("lnCancel").addEventListener("click", closeModal);
+  const ta = document.getElementById("lnText"); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  document.getElementById("lnSave").addEventListener("click", ()=>{ saveListingNote(info, ta.value); closeModal(); render(); toast(ta.value.trim()?"Note saved":"Note removed"); });
+}
+document.addEventListener("click", (e)=>{
+  const b = e.target.closest("[data-listing-note]"); if(!b) return;
+  const info = listingInfo(currentScreen()); if(info) openListingNoteModal(info);
+});
+
+/* ================= Topics list (global within syllabus) ================= */
+const TOPIC_SORTS = [["freq","Frequency"],["az","A–Z"],["studied","Studied"],["label","Label"],["lists","📌 My lists"]];
+function topicRowHtml(e, idx, extraInner){
+  const studied = e.studied;
+  const attempts = countTopicAttempts(e.subject, e.topic);
+  const bits = [e.subject];
+  if(studied) bits.push(`📖 ${studied}×`);
+  if(attempts) bits.push(`📝 ${attempts} test${attempts===1?"":"s"}`);
+  const dsx = diffSuffix(visibleQuestions().filter(q=>q.subject===e.subject && (q.topic||FALLBACK_TOPIC)===e.topic)); if(dsx) bits.push(dsx.replace(' · ',''));
+  return rowHtml({
+    num: String(idx+1).padStart(2,"0"), title: e.topic, sub: bits.join(" · "), count: `${e.count} q`,
+    dataAttr: `data-subject="${escapeHtml(e.subject)}" data-topic="${escapeHtml(e.topic)}" data-lp="1"`
+  }).replace('<div class="row" ','<div class="row lp-target" ').replace('<div class="count">', `${labelPillHtml(e.subject,e.topic)}<div class="count">${extraInner||""}`);
+}
+function chipBarHtml(chips){
+  return `<div class="chip-bar" id="chipBar">${chips.map(c=>`<button type="button" class="chip ${c.active?"active":""}" data-chip="${escapeHtml(c.id)}" ${c.color?`style="--chip:${c.color};"`:""}>${c.color?`<span class="chip-dot" style="background:${c.color};"></span>`:""}${escapeHtml(c.label)}${c.count!==undefined?` <span class="chip-n">${c.count}</span>`:""}</button>`).join("")}</div>`;
+}
 function renderTopicsList(){
   const screen = currentScreen();
   const searchTerm = getSearch();
-  const topicListSort = screen.topicListSort || "freq";
+  const sortMode = screen.topicListSort || "freq";
   const qs = visibleQuestions();
   const counts = {};
-  qs.forEach(q=>{
-    const key = `${q.subject}|||${q.topic||FALLBACK_TOPIC}`;
-    counts[key] = (counts[key]||0) + 1;
-  });
+  qs.forEach(q=>{ const key = `${q.subject}|||${q.topic||FALLBACK_TOPIC}`; counts[key] = (counts[key]||0) + 1; });
   let entries = Object.entries(counts).map(([key,count])=>{
     const [subject, topic] = key.split("|||");
     const lbl = getTopicLabel(subject, topic);
-    return { subject, topic, count, label: lbl ? lbl.name : null };
+    return { subject, topic, count, label: lbl ? lbl.name : null, studied: getStudyCount(subject, topic) };
   });
-  if(topicListSort==="label") entries.sort((a,b)=> (a.label||"zzz").localeCompare(b.label||"zzz") || a.topic.localeCompare(b.topic));
-  else if(topicListSort==="az") entries.sort((a,b)=> a.topic.localeCompare(b.topic));
-  else entries.sort((a,b)=> b.count - a.count || a.topic.localeCompare(b.topic));
 
-  let html = `<div style="display:flex;gap:8px;margin-bottom:10px;">
-    <button class="iconbtn" id="myListsBtn" style="flex:1;justify-content:center;">📌 My topic lists</button>
-  </div>`;
-
-  if(entries.length===0){
-    html += emptyState("No topics yet", "Import a question paper into this syllabus to see topics here, ranked by how often they occur.");
-    mainEl.innerHTML = html;
-    document.getElementById("myListsBtn").addEventListener("click", ()=> pushScreen({ type:"topic-lists" }));
+  let html = "";
+  if(entries.length===0 && sortMode!=="lists"){
+    mainEl.innerHTML = emptyState("No topics yet", "Import a question paper into this syllabus to see topics here, ranked by how often they occur.");
     return;
   }
   html += `<input class="search" id="searchBox" placeholder="Search topics…" value="${escapeHtml(searchTerm)}">`;
-  html += `<div class="segmented" id="topicSortSeg">
-    <button data-s="freq" class="${topicListSort==='freq'?'active':''}">Frequency</button>
-    <button data-s="az" class="${topicListSort==='az'?'active':''}">A–Z</button>
-    <button data-s="label" class="${topicListSort==='label'?'active':''}">By label</button>
-  </div>`;
-  html += `<div id="listWrap">`;
-  entries
-    .filter(e=>e.topic.toLowerCase().includes(searchTerm.toLowerCase()) || e.subject.toLowerCase().includes(searchTerm.toLowerCase()))
-    .forEach((e, idx)=>{
-      const studied = getStudyCount(e.subject, e.topic);
-      const attempts = countTopicAttempts(e.subject, e.topic);
-      const bits = [e.subject];
-      if(studied) bits.push(`📖 ${studied}×`);
-      if(attempts) bits.push(`📝 ${attempts} test${attempts===1?"":"s"}`);
-      const dsx = diffSuffix(visibleQuestions().filter(q=>q.subject===e.subject && (q.topic||FALLBACK_TOPIC)===e.topic)); if(dsx) bits.push(dsx.replace(' · ',''));
-      html += rowHtml({
-        num: String(idx+1).padStart(2,"0"),
-        title: e.topic,
-        sub: bits.join(" · "),
-        count: `${e.count} q`,
-        dataAttr: `data-subject="${escapeHtml(e.subject)}" data-topic="${escapeHtml(e.topic)}"`
-      }).replace('<div class="count">', `${labelPillHtml(e.subject,e.topic)}<div class="count">`);
-    });
-  html += `</div>`;
-  mainEl.innerHTML = html;
-  document.getElementById("myListsBtn").addEventListener("click", ()=> pushScreen({ type:"topic-lists" }));
-  document.querySelectorAll("#topicSortSeg button").forEach(btn=>{
-    btn.addEventListener("click", ()=>{ screen.topicListSort = btn.dataset.s; render(); });
-  });
-  document.querySelectorAll("#listWrap .row").forEach(row=>{
+  html += `<div class="segmented scrolly" id="topicSortSeg">${TOPIC_SORTS.map(([k,l])=>`<button data-s="${k}" class="${sortMode===k?'active':''}">${l}</button>`).join("")}</div>`;
+  const matchSearch = e=> !searchTerm || e.topic.toLowerCase().includes(searchTerm.toLowerCase()) || e.subject.toLowerCase().includes(searchTerm.toLowerCase());
+
+  let rowsHtml = "";
+  let afterBind = ()=>{};
+
+  if(sortMode==="lists"){
+    const lists = DATA.topicLists||[];
+    if(!screen.activeListId || !findTopicList(screen.activeListId)) screen.activeListId = lists[0] ? lists[0].id : null;
+    html += chipBarHtml(lists.map(l=>({id:l.id,label:l.name,count:l.items.length,active:l.id===screen.activeListId})).concat([{id:"__new",label:"＋ New list"}]));
+    const list = findTopicList(screen.activeListId);
+    if(!list){
+      rowsHtml = emptyState("No topic lists yet", "Tap “＋ New list” above, or long-press any topic in the other tabs and choose “Add to a topic list”.");
+    } else {
+      html += `<div style="display:flex;gap:8px;margin:8px 0;">
+        <button class="iconbtn" id="renameListBtn" style="flex:1;justify-content:center;">Rename</button>
+        <button class="iconbtn" id="addTopicsBtn" style="flex:1;justify-content:center;">+ Add topics</button>
+        <button class="iconbtn bad" id="deleteListBtn">🗑</button></div>`;
+      html += listingNoteBlockHtml(screen);
+      const items = list.items.map(it=>({ subject:it.subject, topic:it.topic, count:counts[`${it.subject}|||${it.topic}`]||0, studied:getStudyCount(it.subject,it.topic) })).filter(matchSearch);
+      rowsHtml = items.length ? items.map((e,i)=> topicRowHtml(e,i,`<button class="actbtn danger" data-remove-item="${escapeHtml(e.subject+"|||"+e.topic)}" title="Remove from list" style="margin-right:6px;">✕</button>`)).join("") : emptyState(list.items.length?"No matches":"This list is empty", list.items.length?"":"Use “+ Add topics”, or long-press a topic anywhere and choose “Add to a topic list”.");
+      afterBind = ()=>{
+        document.getElementById("renameListBtn").addEventListener("click", ()=>{ const name = prompt("Rename list", list.name); if(name && name.trim()){ list.name = name.trim(); saveData(DATA); render(); } });
+        document.getElementById("deleteListBtn").addEventListener("click", ()=>{ if(confirm(`Delete the list "${list.name}"? Topics and questions are not affected.`)){ DATA.topicLists = DATA.topicLists.filter(l=>l.id!==list.id); screen.activeListId = null; saveData(DATA); render(); } });
+        document.getElementById("addTopicsBtn").addEventListener("click", ()=> openTopicListPickerModal(list.id));
+        document.querySelectorAll("[data-remove-item]").forEach(btn=> btn.addEventListener("click", (ev)=>{ ev.stopPropagation(); const [s,t] = btn.dataset.removeItem.split("|||"); removeTopicFromList(list.id,s,t); render(); }));
+      };
+    }
+    mainEl.innerHTML = html + `<div id="listWrap">${rowsHtml}</div>`;
+    document.querySelectorAll("#chipBar .chip").forEach(c=> c.addEventListener("click", ()=>{
+      if(c.dataset.chip==="__new"){
+        const name = prompt("Name this topic list");
+        if(name && name.trim()){ const l = { id: slugify(name)+"-"+Date.now().toString(36), name:name.trim(), items:[] }; DATA.topicLists.push(l); saveData(DATA); screen.activeListId = l.id; render(); }
+      } else { screen.activeListId = c.dataset.chip; render(); }
+    }));
+    afterBind();
+  } else {
+    if(sortMode==="az") entries.sort((a,b)=> a.topic.localeCompare(b.topic));
+    else if(sortMode==="studied"){
+      const dir = screen.studiedDir || "desc", filt = screen.studiedFilter || "all";
+      html += `<div class="segmented scrolly" id="studiedFilterSeg">${[["all","All"],["0","Not studied"],["1","Studied"],["3","3+ times"]].map(([k,l])=>`<button data-f="${k}" class="${filt===k?'active':''}">${l}</button>`).join("")}</div>
+        <div class="segmented" id="studiedDirSeg"><button data-d="desc" class="${dir==='desc'?'active':''}">Most studied first</button><button data-d="asc" class="${dir==='asc'?'active':''}">Least studied first</button></div>`;
+      if(filt==="0") entries = entries.filter(e=>e.studied===0);
+      else if(filt==="1") entries = entries.filter(e=>e.studied>=1);
+      else if(filt==="3") entries = entries.filter(e=>e.studied>=3);
+      entries.sort((a,b)=> (dir==="desc"? b.studied-a.studied : a.studied-b.studied) || b.count-a.count || a.topic.localeCompare(b.topic));
+    }
+    else if(sortMode==="label"){
+      const sel = screen.labelSel || null;                 // null = all labels included
+      const none = "__none__";
+      const lblCounts = {}; entries.forEach(e=>{ const k=e.label||none; lblCounts[k]=(lblCounts[k]||0)+1; });
+      const chips = [{id:"__all",label:"All",count:entries.length,active:!sel}]
+        .concat(TOPIC_LABEL_PALETTE.map(p=>({id:p.name,label:p.name,color:p.color,count:lblCounts[p.name]||0,active:!!sel && sel.includes(p.name)})))
+        .concat([{id:none,label:"No label",count:lblCounts[none]||0,active:!!sel && sel.includes(none)}]);
+      html += chipBarHtml(chips);
+      html += `<div class="chart-note" style="margin:2px 0 6px;">Tap a colour to see only that colour; tap more colours to add them, tap again to drop one. “All” resets.</div>`;
+      if(sel) entries = entries.filter(e=> sel.includes(e.label||none));
+      const order = n=> { const i = TOPIC_LABEL_PALETTE.findIndex(p=>p.name===n); return i<0? 99 : i; };
+      entries.sort((a,b)=> order(a.label)-order(b.label) || b.count-a.count || a.topic.localeCompare(b.topic));
+    }
+    else entries.sort((a,b)=> b.count - a.count || a.topic.localeCompare(b.topic));
+    const shown = entries.filter(matchSearch);
+    html += `<div class="chart-note" style="margin:2px 0;">Tip: press and hold a topic to add it to a list or give it a label.</div>`;
+    mainEl.innerHTML = html + `<div id="listWrap">${shown.length ? shown.map((e,i)=>topicRowHtml(e,i)).join("") : emptyState("Nothing matches","")}</div>`;
+    document.querySelectorAll("#studiedFilterSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.studiedFilter = b.dataset.f; render(); }));
+    document.querySelectorAll("#studiedDirSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.studiedDir = b.dataset.d; render(); }));
+    document.querySelectorAll("#chipBar .chip").forEach(c=> c.addEventListener("click", ()=>{
+      const id = c.dataset.chip, cur = screen.labelSel;
+      if(id==="__all"){ screen.labelSel = null; }
+      else if(!cur){ screen.labelSel = [id]; }
+      else if(cur.includes(id)){ const n = cur.filter(x=>x!==id); screen.labelSel = n.length ? n : null; }
+      else { screen.labelSel = cur.concat([id]); }
+      render();
+    }));
+  }
+  document.querySelectorAll("#topicSortSeg button").forEach(btn=> btn.addEventListener("click", ()=>{ screen.topicListSort = btn.dataset.s; render(); }));
+  document.querySelectorAll("#listWrap .row[data-topic]").forEach(row=>{
     row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: row.dataset.subject, topic: row.dataset.topic }));
   });
+  const fromList = (sortMode==="lists") ? screen.activeListId : null;
+  bindLongPress("#listWrap .row[data-lp]", el=> openTopicActionsModal(el.dataset.subject, el.dataset.topic, fromList));
   bindSearchInput(renderTopicsList);
 }
 
@@ -765,6 +970,7 @@ function renderSubjectTopicsList(subject){
   html += `<div style="display:flex;gap:8px;margin:0 0 4px;">
     <button class="iconbtn" id="filterPapersBtn" style="flex:1;justify-content:center;">${filterLabel}</button>
   </div>`;
+  html += listingNoteBlockHtml(screen);
 
   if(entries.length===0){
     html += emptyState("No questions tagged with this subject yet", "");
@@ -784,13 +990,14 @@ function renderSubjectTopicsList(subject){
           title: e.topic,
           sub: (bits.length ? bits.join(" · ") : subject) + diffSuffix(visibleQuestions().filter(q=>q.subject===subject && (q.topic||FALLBACK_TOPIC)===e.topic)),
           count: `${e.count} q`,
-          dataAttr: `data-topic="${escapeHtml(e.topic)}"`
-        });
+          dataAttr: `data-topic="${escapeHtml(e.topic)}" data-lp="1"`
+        }).replace('<div class="row" ','<div class="row lp-target" ').replace('<div class="count">', `${labelPillHtml(subject,e.topic)}<div class="count">`);
       });
     html += `</div>`;
   }
 
   mainEl.innerHTML = html;
+  bindLongPress("#listWrap .row[data-lp]", el=> openTopicActionsModal(subject, el.dataset.topic, null));
   document.getElementById("backBtn").addEventListener("click", popScreen);
   document.getElementById("renameSubjectBtn").addEventListener("click", ()=> openRenameSubjectModal(subject));
   document.getElementById("viewAllBtn").addEventListener("click", ()=> pushScreen({ type:"subject-all", subject, includedPapers: screen.includedPapers }));
@@ -853,10 +1060,10 @@ function bindSwipeNav(questions, screen){
   const idx = screen.qIndex||0;
   const navBar = document.createElement("div");
   navBar.className = "bottomnav";
-  navBar.innerHTML = `<div class="bottomnav-inner" style="justify-content:center;gap:16px;">
-    <button class="iconbtn" id="swipePrevFixed" ${idx<=0?"disabled":""}>‹ Prev</button>
+  navBar.innerHTML = `<div class="bottomnav-inner" style="justify-content:center;align-items:center;gap:14px;">
+    <button class="iconbtn swipe-nav-btn" id="swipePrevFixed" ${idx<=0?"disabled":""}>‹ Prev</button>
     <div class="progress">${idx+1} of ${questions.length}</div>
-    <button class="iconbtn" id="swipeNextFixed" ${idx>=questions.length-1?"disabled":""}>Next ›</button>
+    <button class="iconbtn swipe-nav-btn" id="swipeNextFixed" ${idx>=questions.length-1?"disabled":""}>Next ›</button>
   </div>`;
   document.body.appendChild(navBar);
   document.getElementById("swipePrevFixed").addEventListener("click", ()=>{ if((screen.qIndex||0)>0){ screen.qIndex=(screen.qIndex||0)-1; render(); } });
@@ -884,6 +1091,7 @@ function renderQuestionListScreen({ backLabel, onBack, title, meta, questions, a
   </div>`;
 
   if(actionsHtml) html += actionsHtml;
+  html += listingNoteBlockHtml(screen);
 
   if(allowPractice && questions.length>0){
     html += `<div style="display:flex;gap:8px;margin:8px 0 4px;">
@@ -1158,7 +1366,6 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
   const isDeleted = Number(q.correct_answer_index) === DELETED_SENTINEL;
   const originalNum = questionOriginalNumber(q);
   const flagged = !!q.flagged;
-  const hasNote = !!(q.note && q.note.trim());
   const diffEnabled = isDifficultyMarkingEnabled();
 
   const opts = (q.options||[]).map((opt, i)=>{
@@ -1182,7 +1389,7 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
   }
 
   const diffRow = diffEnabled ? `<div class="diff-row">
-    <span class="diff-label">Difficulty:</span>
+    <span class="diff-label">Difficulty${q.difficulty_auto?" (auto — tap to change)":""}:</span>
     ${["E","M","D"].map(lv=>`<button type="button" class="diff-btn diff-${lv} ${q.difficulty===lv?"active":""}" data-action="set-difficulty" data-level="${lv}">${lv}</button>`).join("")}
   </div>` : "";
 
@@ -1200,7 +1407,6 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
     <div class="actions-row">
       <div class="grp">
         <button class="actbtn ${flagged?"flagged":""}" data-action="toggle-flag" title="Flag for review">${flagged?"⭐":"☆"}</button>
-        <button class="actbtn ${hasNote?"has-note":""}" data-action="edit-note" title="Notes">${hasNote?"🗒️":"📄"}</button>
         <button class="actbtn" data-action="copy-question" title="Copy this question">📋</button>
         <button class="actbtn" data-action="edit-question" title="Edit question">📝</button>
         <button class="actbtn" data-ai="q" data-paper="${escapeHtml(q._paperId)}" data-qid="${escapeHtml(q.id)}" title="AI help">🤖</button>
@@ -1215,7 +1421,6 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
     <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options">${opts}</ul>
     ${expl}
-    ${hasNote ? `<div class="note-preview">🗒️ ${escapeHtml(q.note.slice(0,140))}${q.note.length>140?"…":""}</div>` : ""}
     ${hint ? `<div class="opthint">${hint}</div>` : ""}
   </div>`;
 }
@@ -1457,9 +1662,13 @@ function openEditQuestionModal(paperId, qid){
 /* ================= Paper filter modal (with templates) ================= */
 function openPaperFilterModal(currentIncluded, papersInScope, scopeTag, onApply){
   let selected = currentIncluded ? new Set(currentIncluded) : new Set(papersInScope.map(p=>p.id));
+  let paperTerm = "";
+  const visiblePapers = ()=>{ const t = paperTerm.trim().toLowerCase(); return t ? papersInScope.filter(p=> p.name.toLowerCase().includes(t) || (p.post_name||"").toLowerCase().includes(t)) : papersInScope; };
 
   function listHtml(){
-    return papersInScope.map(p=>{
+    const vis = visiblePapers();
+    if(!vis.length) return `<div class="meta" style="padding:8px 2px;">No exam matches “${escapeHtml(paperTerm)}”.</div>`;
+    return vis.map(p=>{
       const checked = selected.has(p.id);
       return `<button type="button" class="check-item ${checked?"checked":""}" data-paper-id="${escapeHtml(p.id)}">
         <span class="box">${checked?"✓":""}</span>
@@ -1487,9 +1696,10 @@ function openPaperFilterModal(currentIncluded, papersInScope, scopeTag, onApply)
     <div class="modal">
       <h3>Choose exams to include</h3>
       <div class="meta" style="margin-bottom:10px;">Only affects this listing — untick an exam to exclude its questions.</div>
+      <input class="search" id="paperSearch" placeholder="Search exams by name or post…" autocomplete="off">
       <div class="row-btns" style="margin-top:0;margin-bottom:10px;">
-        <button class="iconbtn" id="selectAllBtn" style="flex:1;justify-content:center;">Select all</button>
-        <button class="iconbtn" id="selectNoneBtn" style="flex:1;justify-content:center;">Select none</button>
+        <button class="iconbtn" id="selectAllBtn" style="flex:1;justify-content:center;">Select all${""} shown</button>
+        <button class="iconbtn" id="selectNoneBtn" style="flex:1;justify-content:center;">Select none shown</button>
       </div>
       <div id="paperCheckList" style="max-height:36vh;overflow-y:auto;">${listHtml()}</div>
       <div class="divider">— saved templates —</div>
@@ -1545,13 +1755,18 @@ function openPaperFilterModal(currentIncluded, papersInScope, scopeTag, onApply)
 
   document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
   document.getElementById("cancelFilter").addEventListener("click", closeModal);
+  document.getElementById("paperSearch").addEventListener("input", e=>{
+    paperTerm = e.target.value;
+    document.getElementById("paperCheckList").innerHTML = listHtml();
+    rebindChecks();
+  });
   document.getElementById("selectAllBtn").addEventListener("click", ()=>{
-    papersInScope.forEach(p=>selected.add(p.id));
+    visiblePapers().forEach(p=>selected.add(p.id));
     document.getElementById("paperCheckList").innerHTML = listHtml();
     rebindChecks();
   });
   document.getElementById("selectNoneBtn").addEventListener("click", ()=>{
-    selected.clear();
+    visiblePapers().forEach(p=>selected.delete(p.id));
     document.getElementById("paperCheckList").innerHTML = listHtml();
     rebindChecks();
   });
@@ -1803,7 +2018,7 @@ function practiceSlipHtml(q, idx, selectedIndex, guessed){
     </li>`;
   }).join("");
   const diffRow = diffEnabled ? `<div class="diff-row">
-    <span class="diff-label">Difficulty:</span>
+    <span class="diff-label">Difficulty${q.difficulty_auto?" (auto — tap to change)":""}:</span>
     ${["E","M","D"].map(lv=>`<button type="button" class="diff-btn diff-${lv} ${q.difficulty===lv?"active":""}" data-action="set-difficulty" data-level="${lv}">${lv}</button>`).join("")}
   </div>` : "";
   return `<div class="slip" data-qid="${escapeHtml(q._paperId)}::${escapeHtml(q.id)}">
@@ -1885,6 +2100,7 @@ function submitPracticeTest(screen, autoSubmitted){
   const idxMap = buildQuestionIndex();
   const orderedQuestions = screen.questionRefs.map(ref=> idxMap[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
   flushCurrentQuestionTime(screen, orderedQuestions);
+  orderedQuestions.forEach(q=> maybeAutoDifficulty(screen, q));
 
   const results = computeAttemptResults(screen.questionRefs, screen.answers, screen.guesses);
   if(screen.timeSpent){
@@ -1947,11 +2163,32 @@ function togglePause(screen){
     screen.paused = false;
     screen.pausedAt = null;
   } else {
+    // stop the per-question stopwatch so paused time is never counted
+    const idxMap = buildQuestionIndex();
+    const qs = screen.questionRefs.map(ref=> idxMap[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
+    flushCurrentQuestionTime(screen, qs);
+    screen._qStartedAt = undefined;
     screen.paused = true;
     screen.pausedAt = Date.now();
   }
   render();
 }
+/* Also stop per-question timing while the app is in the background */
+document.addEventListener("visibilitychange", ()=>{
+  const sc = (typeof currentScreen==="function") ? currentScreen() : null;
+  if(!sc || sc.type!=="practice" || sc.submitted) return;
+  if(document.hidden){
+    if(sc._qStartedAt!==undefined && !sc.paused){
+      const idxMap = buildQuestionIndex();
+      const qs = sc.questionRefs.map(ref=> idxMap[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
+      flushCurrentQuestionTime(sc, qs);
+      sc._qStartedAt = undefined; sc._bg = true;
+    }
+  } else if(sc._bg){
+    sc._bg = false;
+    if(!sc.paused){ sc._qStartedAt = Date.now(); sc._lastIndex = sc.qIndex||0; }
+  }
+});
 
 function startPracticeTimerTick(screen){
   function tick(){
@@ -1987,7 +2224,9 @@ function renderPracticeScreen(screen){
     if(!screen.paused){
       if(screen._qStartedAt===undefined){ screen._qStartedAt = nowTs; screen._lastIndex = screen.qIndex||0; }
       else if(screen._lastIndex !== (screen.qIndex||0)){
+        const leftIdx = screen._lastIndex;
         flushCurrentQuestionTime(screen, questions);
+        maybeAutoDifficulty(screen, questions[leftIdx]);
         screen._lastIndex = screen.qIndex||0;
       }
     }
@@ -2288,8 +2527,12 @@ function renderBankDetail(bankId){
     <button class="iconbtn" id="importToBankBtn" style="flex:1;justify-content:center;">+ Import JSON</button>
   </div>
   <div style="display:flex;gap:8px;margin:0 0 4px;">
+    <button class="iconbtn" id="typeQuestionBtn" style="flex:1;justify-content:center;">✍️ Type a question</button>
+  </div>
+  <div style="display:flex;gap:8px;margin:0 0 4px;">
     <button class="iconbtn primary" id="randomExamBtn" style="flex:1;justify-content:center;">Create random exam</button>
   </div>`;
+  html += listingNoteBlockHtml(screen);
   html += `<div style="display:flex;gap:8px;margin:8px 0 4px;flex-wrap:wrap;">
     <button class="iconbtn" id="toggleAnswersBtn" style="flex:1;justify-content:center;">${hideAnswers ? "Show answers" : "Hide answers"}</button>
     <button class="iconbtn ${locked?"":"good"}" id="toggleLockBtn" style="flex:1;justify-content:center;">${locked?"🔒 Answers locked":"🔓 Answers unlocked"}</button>
@@ -2322,6 +2565,7 @@ function renderBankDetail(bankId){
   });
   document.getElementById("addFromPoolBtn").addEventListener("click", ()=> openQuestionPickerModal(bankId));
   document.getElementById("importToBankBtn").addEventListener("click", ()=> openImportToBankModal(bankId));
+  document.getElementById("typeQuestionBtn").addEventListener("click", ()=> openTypeQuestionModal(bankId));
   document.getElementById("randomExamBtn").addEventListener("click", ()=> openRandomExamModal(bank));
   const toggleAnswersBtn = document.getElementById("toggleAnswersBtn");
   if(toggleAnswersBtn) toggleAnswersBtn.addEventListener("click", ()=>{ screen.hideAnswers=!hideAnswers; render(); });
@@ -2343,78 +2587,293 @@ function renderBankDetail(bankId){
   }
 }
 
+
+/* ---- Full-question preview popup (used on long-press in pickers and search) ---- */
+function openQuestionPreview(q){
+  const ci = q.correct_answer_index;
+  const hasKey = ci!==null && ci!==undefined && Number(ci)!==DELETED_SENTINEL;
+  const ov = document.createElement("div");
+  ov.className = "preview-overlay";
+  ov.innerHTML = `<div class="preview-card">
+    <div class="preview-meta">${escapeHtml(q._paperName||"")} · ${escapeHtml(q.subject||"")} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}${q.difficulty?` · ${DIFFICULTY_LABELS[q.difficulty]}`:""}</div>
+    <div class="qtext" style="margin:8px 0;">${renderRichText(q.question_text)}</div>
+    <ul class="options" style="list-style:none;padding:0;margin:0;">${(q.options||[]).map((o,i)=>`<li style="display:flex;gap:8px;padding:5px 0;${hasKey&&Number(ci)===i?"color:var(--good);font-weight:600;":""}"><b>${letterFor(i)}</b><span>${renderRichText(o)}</span></li>`).join("")}</ul>
+    ${hasKey?"":`<div class="chart-note">${Number(ci)===DELETED_SENTINEL?"Deleted by PSC.":"No marked answer."}</div>`}
+    ${q.explanation&&q.explanation.trim()?`<div class="explanation-block" style="margin-top:8px;"><div class="exp-label">Explanation</div>${renderRichText(q.explanation)}</div>`:""}
+    <button class="iconbtn primary" style="width:100%;justify-content:center;margin-top:12px;" id="pvClose">Close</button>
+  </div>`;
+  document.body.appendChild(ov);
+  const close = ()=> ov.remove();
+  ov.addEventListener("click",(e)=>{ if(e.target===ov) close(); });
+  ov.querySelector("#pvClose").addEventListener("click", close);
+  typesetMath(ov);
+}
+
+/* ---- Shared question-filter widgets (subject / topic / paper selects) ---- */
+function optionsHtml(values, current, allLabel){
+  return `<option value="">${allLabel}</option>` + values.map(v=>`<option value="${escapeHtml(v.value)}" ${current===v.value?"selected":""}>${escapeHtml(v.label)}</option>`).join("");
+}
+function distinctFilterOptions(pool, f){
+  const subjects = Array.from(new Set(pool.map(q=>q.subject))).sort().map(v=>({value:v,label:v}));
+  const topics = Array.from(new Set(pool.filter(q=>!f.subject||q.subject===f.subject).map(q=>q.topic||FALLBACK_TOPIC))).sort().map(v=>({value:v,label:v}));
+  const papersMap = {};
+  pool.filter(q=> (!f.subject||q.subject===f.subject) && (!f.topic||(q.topic||FALLBACK_TOPIC)===f.topic)).forEach(q=>{ papersMap[q._paperId]=q._paperName; });
+  const papers = Object.entries(papersMap).sort((a,b)=>a[1].localeCompare(b[1])).map(([id,name])=>({value:id,label:name}));
+  return { subjects, topics, papers };
+}
+function applyQuestionFilters(pool, f){
+  const t = (f.term||"").toLowerCase();
+  return pool.filter(q=>
+    (!f.subject || q.subject===f.subject) &&
+    (!f.topic || (q.topic||FALLBACK_TOPIC)===f.topic) &&
+    (!f.paper || q._paperId===f.paper) &&
+    (!t || q.question_text.toLowerCase().includes(t) || (q.options||[]).some(o=>String(o).toLowerCase().includes(t)) || q.subject.toLowerCase().includes(t) || (q.topic||"").toLowerCase().includes(t) || q._paperName.toLowerCase().includes(t)));
+}
+
+/* ================= Question picker for banks (filters + long-press preview) ================= */
 function openQuestionPickerModal(bankId){
   const bank = DATA.banks.find(b=>b.id===bankId);
   if(!bank) return;
   const existingKeys = new Set(bank.questionRefs.map(r=>`${r.paperId}::${r.qid}`));
-  const all = allQuestions();
-  let term = "";
-  let picked = new Set();
+  const cur = getCurrentSyllabusId();
+  const f = { term:"", subject:"", topic:"", paper:"", scope:"current" };
+  const picked = new Set();
+  const LIMIT = 200;
+  const basePool = ()=> allQuestions().filter(q=> !existingKeys.has(`${q._paperId}::${q.id}`) && (f.scope==="all" || q._syllabusId===cur));
+  let shown = [];
 
-  function filtered(){
-    const t = term.toLowerCase();
-    return all.filter(q=> !existingKeys.has(`${q._paperId}::${q.id}`) &&
-      (!t || q.question_text.toLowerCase().includes(t) || q.subject.toLowerCase().includes(t) || (q.topic||"").toLowerCase().includes(t) || q._paperName.toLowerCase().includes(t)));
+  modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal tall">
+    <h3>Add questions to “${escapeHtml(bank.name)}”</h3>
+    <input class="search" id="pickerSearch" placeholder="Search question text, options…" value="">
+    <div class="filter-grid">
+      <select class="ai-input" id="fScope"><option value="current">This syllabus</option><option value="all">All syllabuses</option></select>
+      <select class="ai-input" id="fSubject"></select>
+      <select class="ai-input" id="fTopic"></select>
+      <select class="ai-input" id="fPaper"></select>
+    </div>
+    <div class="meta" id="pickerCount" style="margin:6px 0;"></div>
+    <div style="display:flex;gap:8px;margin-bottom:6px;">
+      <button class="iconbtn" id="selShown" style="flex:1;justify-content:center;">Select all shown</button>
+      <button class="iconbtn" id="selClear" style="flex:1;justify-content:center;">Clear selection</button>
+    </div>
+    <div class="chart-note" style="margin:0 0 6px;">Tip: press and hold a question to read it in full.</div>
+    <div class="scroll-area" id="pickerList"></div>
+    <div class="row-btns">
+      <button class="iconbtn" id="cancelPicker" style="flex:1;justify-content:center;">Cancel</button>
+      <button class="iconbtn primary" id="addPicked" style="flex:1;justify-content:center;">Add selected</button>
+    </div>
+  </div></div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("cancelPicker").addEventListener("click", closeModal);
+
+  function refreshSelects(){
+    const pool = basePool();
+    const o = distinctFilterOptions(pool, f);
+    if(f.subject && !o.subjects.some(x=>x.value===f.subject)) { f.subject=""; }
+    if(f.topic && !o.topics.some(x=>x.value===f.topic)) { f.topic=""; }
+    if(f.paper && !o.papers.some(x=>x.value===f.paper)) { f.paper=""; }
+    document.getElementById("fSubject").innerHTML = optionsHtml(o.subjects, f.subject, "All subjects");
+    document.getElementById("fTopic").innerHTML = optionsHtml(o.topics, f.topic, "All topics");
+    document.getElementById("fPaper").innerHTML = optionsHtml(o.papers, f.paper, "All question papers");
   }
-  function listHtml(){
-    return filtered().slice(0,150).map(q=>{
-      const key = `${q._paperId}::${q.id}`;
-      const checked = picked.has(key);
-      return `<button type="button" class="check-item ${checked?"checked":""}" data-qkey="${escapeHtml(key)}">
+  function updateList(){
+    const matches = applyQuestionFilters(basePool(), f);
+    shown = matches.slice(0, LIMIT);
+    document.getElementById("pickerCount").textContent = `${picked.size} selected · ${matches.length} match${matches.length===1?"":"es"}${matches.length>LIMIT?` (showing first ${LIMIT} — narrow the filters)`:""}`;
+    document.getElementById("pickerList").innerHTML = shown.map(q=>{
+      const key = `${q._paperId}::${q.id}`, checked = picked.has(key);
+      return `<button type="button" class="check-item lp-target ${checked?"checked":""}" data-qkey="${escapeHtml(key)}">
         <span class="box">${checked?"✓":""}</span>
-        <span style="flex:1;">
-          <div style="font-size:0.82rem;">${escapeHtml(q.question_text.slice(0,90))}${q.question_text.length>90?"…":""}</div>
-          <div class="ci-sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div>
-        </span>
-      </button>`;
+        <span style="flex:1;min-width:0;">
+          <div class="clamp2">${escapeHtml(q.question_text)}</div>
+          <div class="ci-sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}${q.difficulty?` · ${q.difficulty}`:""}</div>
+        </span></button>`;
     }).join("") || `<div class="meta">No matching questions.</div>`;
-  }
-
-  function draw(){
-    modalRoot.innerHTML = `
-    <div class="modal-backdrop" id="backdrop">
-      <div class="modal">
-        <h3>Add questions to "${escapeHtml(bank.name)}"</h3>
-        <input class="search" id="pickerSearch" placeholder="Search question text, paper, subject, topic…" value="${escapeHtml(term)}">
-        <div class="meta" style="margin:6px 0;">${picked.size} selected · showing up to 150 matches</div>
-        <div id="pickerList" style="max-height:46vh;overflow-y:auto;">${listHtml()}</div>
-        <div class="row-btns">
-          <button class="iconbtn" id="cancelPicker" style="flex:1;justify-content:center;">Cancel</button>
-          <button class="iconbtn primary" id="addPicked" style="flex:1;justify-content:center;">Add selected</button>
-        </div>
-      </div>
-    </div>`;
-    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
-    document.getElementById("cancelPicker").addEventListener("click", closeModal);
-    document.getElementById("pickerSearch").addEventListener("input", (e)=>{
-      const pos = e.target.selectionStart;
-      term = e.target.value; draw();
-      const nb = document.getElementById("pickerSearch");
-      if(nb){ nb.focus(); nb.setSelectionRange(pos,pos); }
-    });
-    document.querySelectorAll("[data-qkey]").forEach(btn=>{
+    const byKey = {}; shown.forEach(q=> byKey[`${q._paperId}::${q.id}`] = q);
+    document.querySelectorAll("#pickerList [data-qkey]").forEach(btn=>{
       btn.addEventListener("click", ()=>{
         const key = btn.dataset.qkey;
         if(picked.has(key)) picked.delete(key); else picked.add(key);
-        document.getElementById("pickerList").innerHTML = listHtml();
-        document.querySelectorAll("[data-qkey]").forEach(b2=>{
-          b2.addEventListener("click", arguments.callee);
-        });
-        draw();
+        btn.classList.toggle("checked"); btn.querySelector(".box").textContent = picked.has(key)?"✓":"";
+        const total = applyQuestionFilters(basePool(), f).length;
+        document.getElementById("pickerCount").textContent = `${picked.size} selected · ${total} match${total===1?"":"es"}`;
       });
     });
-    document.getElementById("addPicked").addEventListener("click", ()=>{
-      picked.forEach(key=>{
-        const [paperId, qid] = key.split("::");
-        bank.questionRefs.push({ paperId, qid });
-      });
-      saveData(DATA);
-      closeModal();
-      render();
-      toast(`Added ${picked.size} question(s) to bank`);
+    bindLongPress("#pickerList [data-qkey]", el=>{ const q = byKey[el.dataset.qkey]; if(q) openQuestionPreview(q); });
+  }
+  refreshSelects(); updateList();
+  let tmr = null;
+  document.getElementById("pickerSearch").addEventListener("input", e=>{ f.term = e.target.value; clearTimeout(tmr); tmr = setTimeout(updateList, 120); });
+  document.getElementById("fScope").addEventListener("change", e=>{ f.scope=e.target.value; f.subject=f.topic=f.paper=""; refreshSelects(); updateList(); });
+  document.getElementById("fSubject").addEventListener("change", e=>{ f.subject=e.target.value; f.topic=""; f.paper=""; refreshSelects(); updateList(); });
+  document.getElementById("fTopic").addEventListener("change", e=>{ f.topic=e.target.value; f.paper=""; refreshSelects(); updateList(); });
+  document.getElementById("fPaper").addEventListener("change", e=>{ f.paper=e.target.value; updateList(); });
+  document.getElementById("selShown").addEventListener("click", ()=>{ applyQuestionFilters(basePool(), f).forEach(q=> picked.add(`${q._paperId}::${q.id}`)); updateList(); });
+  document.getElementById("selClear").addEventListener("click", ()=>{ picked.clear(); updateList(); });
+  document.getElementById("addPicked").addEventListener("click", ()=>{
+    if(!picked.size){ toast("Select some questions first"); return; }
+    picked.forEach(key=>{ const [paperId, qid] = key.split("::"); bank.questionRefs.push({ paperId, qid }); });
+    saveData(DATA); const n = picked.size; closeModal(); render(); toast(`Added ${n} question${n===1?"":"s"} to bank`);
+  });
+}
+
+/* ================= Type a question into a bank ================= */
+function openTypeQuestionModal(bankId){
+  const bank = DATA.banks.find(b=>b.id===bankId); if(!bank) return;
+  const subjects = getAllSubjects().sort();
+  let subject = subjects.includes("General Knowledge") ? "General Knowledge" : (subjects[0]||"");
+  let nOpts = 4;
+  function draw(keep){
+    const v = keep || {};
+    const topics = subject ? getTopicsForSubject(subject) : [FALLBACK_TOPIC];
+    modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal tall">
+      <h3>✍️ Type a question</h3>
+      <div class="scroll-area">
+        <div class="field"><label>Question</label><textarea id="tqText" class="prose" style="min-height:90px;" placeholder="Type the question. **bold**, *italic* and $math$ work.">${escapeHtml(v.text||"")}</textarea></div>
+        ${Array.from({length:nOpts}).map((_,i)=>`<div class="field" style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+          <label style="margin:0;display:flex;align-items:center;gap:6px;min-width:64px;"><input type="radio" name="tqCorrect" value="${i}" ${String(v.correct)===String(i)?"checked":""}> ${letterFor(i)}</label>
+          <input class="ai-input tqOpt" data-i="${i}" placeholder="Option ${letterFor(i)}" value="${escapeHtml((v.opts||[])[i]||"")}"></div>`).join("")}
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          ${nOpts<6?`<button class="iconbtn" id="tqMore" style="flex:1;justify-content:center;">+ Option</button>`:""}
+          ${nOpts>2?`<button class="iconbtn" id="tqLess" style="flex:1;justify-content:center;">− Option</button>`:""}
+          <button class="iconbtn" id="tqNoKey" style="flex:1;justify-content:center;">No answer</button>
+        </div>
+        <div class="chart-note">Select the radio next to the correct option (or leave none selected if you don't know yet).</div>
+        <div class="field"><label>Explanation (optional)</label><textarea id="tqExpl" class="prose" style="min-height:70px;">${escapeHtml(v.expl||"")}</textarea></div>
+        <div class="field"><label>Subject</label><select class="ai-input" id="tqSubject">${subjects.map(s=>`<option ${s===subject?"selected":""}>${escapeHtml(s)}</option>`).join("")}</select></div>
+        <div class="field"><label>Topic</label><select class="ai-input" id="tqTopic">${topics.map(t=>`<option ${t===v.topic?"selected":""}>${escapeHtml(t)}</option>`).join("")}</select></div>
+        <div class="field"><label>Store question</label><select class="ai-input" id="tqStore"><option value="bank" ${v.store!=="pool"?"selected":""}>In this bank only</option><option value="pool" ${v.store==="pool"?"selected":""}>In this bank AND my syllabus pool (shows under Subjects / Topics)</option></select></div>
+      </div>
+      <div class="row-btns"><button class="iconbtn" id="tqCancel" style="flex:1;justify-content:center;">Cancel</button>
+        <button class="iconbtn primary" id="tqSave" style="flex:1;justify-content:center;">Add to bank</button></div>
+    </div></div>`;
+    const snap = ()=>({ text:document.getElementById("tqText").value, expl:document.getElementById("tqExpl").value, topic:document.getElementById("tqTopic").value, store:document.getElementById("tqStore").value,
+      opts:Array.from(document.querySelectorAll(".tqOpt")).map(i=>i.value), correct:(document.querySelector('input[name="tqCorrect"]:checked')||{}).value });
+    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+    document.getElementById("tqCancel").addEventListener("click", closeModal);
+    const m=document.getElementById("tqMore"), l=document.getElementById("tqLess");
+    if(m) m.addEventListener("click", ()=>{ const s=snap(); nOpts++; draw(s); });
+    if(l) l.addEventListener("click", ()=>{ const s=snap(); nOpts--; if(String(s.correct)>=String(nOpts)) s.correct=undefined; draw(s); });
+    document.getElementById("tqNoKey").addEventListener("click", ()=>{ document.querySelectorAll('input[name="tqCorrect"]').forEach(r=>r.checked=false); });
+    document.getElementById("tqSubject").addEventListener("change", e=>{ const s=snap(); subject=e.target.value; s.topic=""; draw(s); });
+    document.getElementById("tqSave").addEventListener("click", ()=>{
+      const s = snap();
+      const text = s.text.trim();
+      const opts = s.opts.map(o=>o.trim());
+      const filled = opts.filter(o=>o);
+      if(!text){ toast("Type the question first"); return; }
+      if(filled.length<2){ toast("Add at least two options"); return; }
+      // keep option positions compact but preserve which one is correct
+      let correct = null;
+      const compact = [];
+      opts.forEach((o,i)=>{ if(o){ if(String(s.correct)===String(i)) correct = compact.length; compact.push(o); } });
+      if(s.correct!==undefined && correct===null){ toast("The option marked correct is empty"); return; }
+      const toPool = s.store==="pool";
+      const cur = getCurrentSyllabusId();
+      const pid = toPool ? "typed-"+cur : "typed-bank-"+bank.id;
+      let paper = DATA.papers.find(p=>p.id===pid);
+      if(!paper){
+        paper = toPool ? { id:pid, name:"My typed questions", post_name:"", syllabus_id:cur, questions:[] }
+                       : { id:pid, name:"Typed: "+bank.name, post_name:"", syllabus_id:"__bank_only__", is_bank_only:true, questions:[] };
+        DATA.papers.push(paper);
+      }
+      const n = (paper.questions||[]).length + 1;
+      const q = { id:"t"+Date.now().toString(36)+n, original_number:"T-"+n, question_text:text, options:compact, correct_answer_index:correct,
+        subject, topic: s.topic||FALLBACK_TOPIC };
+      if(s.expl.trim()) q.explanation = s.expl.trim();
+      paper.questions.push(q);
+      bank.questionRefs.push({ paperId:pid, qid:String(q.id) });
+      saveData(DATA); closeModal(); render(); toast("Question added to bank");
     });
   }
   draw();
+}
+
+/* ================= Global search (scope-aware) + results as a full listing ================= */
+const SEARCH_SCOPE_KEY = "psev_search_scope";
+function getSearchScope(){
+  try{ const o = JSON.parse(localStorage.getItem(SEARCH_SCOPE_KEY)||"null"); if(o && (o.mode==="current"||o.mode==="all"||o.mode==="pick")) return { mode:o.mode, ids:Array.isArray(o.ids)?o.ids:[] }; }catch(e){}
+  return { mode:"current", ids:[] };
+}
+function setSearchScope(sc){ try{ localStorage.setItem(SEARCH_SCOPE_KEY, JSON.stringify(sc)); }catch(e){} }
+function searchScopeLabel(sc){
+  if(sc.mode==="current") return `current syllabus (${getSyllabusById(getCurrentSyllabusId()).name})`;
+  if(sc.mode==="all") return "all syllabuses";
+  const names = sc.ids.map(id=>{ const s=DATA.syllabuses.find(x=>x.id===id); return s?s.name:null; }).filter(Boolean);
+  return names.length ? names.join(", ") : "no syllabus selected";
+}
+function searchPool(sc){
+  const cur = getCurrentSyllabusId();
+  return allQuestions().filter(q=>{
+    if(q._syllabusId==="__bank_only__") return false;
+    if(sc.mode==="all") return true;
+    if(sc.mode==="pick") return sc.ids.includes(q._syllabusId);
+    return q._syllabusId===cur;
+  });
+}
+function searchQuestions(term, sc){
+  if(!term || !term.trim()) return [];
+  return applyQuestionFilters(searchPool(sc), { term });
+}
+function renderSearchResults(screen){
+  const sc = screen.scope || getSearchScope();
+  const questions = searchQuestions(screen.term, sc);
+  renderQuestionListScreen({
+    backLabel: "Back",
+    onBack: popScreen,
+    title: `Search: “${screen.term}”`,
+    meta: `${questions.length} result${questions.length===1?"":"s"} in ${searchScopeLabel(sc)}`,
+    questions,
+    allowPractice: true,
+    practiceInfo: { sourceType:"search", scopeKey:"search:"+screen.term, scopeLabel:"Search: "+screen.term, syllabusId: getCurrentSyllabusId() }
+  });
+}
+function openGlobalSearchModal(){
+  let term = "";
+  let sc = getSearchScope();
+  modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal tall">
+    <h3>Search questions</h3>
+    <input class="search" id="globalSearchInput" placeholder="Search text, options, subject, topic, paper…" value="">
+    <div class="segmented" id="scopeSeg"><button data-m="current">This syllabus</button><button data-m="all">All</button><button data-m="pick">Choose…</button></div>
+    <div id="scopePick"></div>
+    <div class="meta" id="searchInfo" style="margin:6px 0;"></div>
+    <div id="searchViewAll"></div>
+    <div class="scroll-area" id="globalSearchResults"></div>
+    <div class="row-btns"><button class="iconbtn" id="closeSearch" style="width:100%;justify-content:center;">Close</button></div>
+  </div></div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("closeSearch").addEventListener("click", closeModal);
+  function drawScope(){
+    document.querySelectorAll("#scopeSeg button").forEach(b=> b.classList.toggle("active", b.dataset.m===sc.mode));
+    const pick = document.getElementById("scopePick");
+    pick.innerHTML = sc.mode==="pick" ? `<div class="chip-bar" style="position:static;">${DATA.syllabuses.map(s=>`<button type="button" class="chip ${sc.ids.includes(s.id)?"active":""}" data-sid="${escapeHtml(s.id)}">${escapeHtml(s.name)}</button>`).join("")}</div>` : "";
+    pick.querySelectorAll("[data-sid]").forEach(b=> b.addEventListener("click", ()=>{
+      sc.ids = sc.ids.includes(b.dataset.sid) ? sc.ids.filter(x=>x!==b.dataset.sid) : sc.ids.concat([b.dataset.sid]);
+      setSearchScope(sc); drawScope(); drawResults();
+    }));
+  }
+  function drawResults(){
+    const list = searchQuestions(term, sc);
+    const shown = list.slice(0,80);
+    document.getElementById("searchInfo").textContent = term.trim() ? `${list.length} match${list.length===1?"":"es"} in ${searchScopeLabel(sc)}${list.length>80?" (preview shows 80)":""}` : `Searching ${searchScopeLabel(sc)}`;
+    document.getElementById("searchViewAll").innerHTML = list.length ? `<button class="iconbtn primary" id="viewAllResults" style="width:100%;justify-content:center;margin-bottom:6px;">📋 View all ${list.length} as a list (practice, sort, swipe…)</button><div class="chart-note" style="margin:0 0 6px;">Press and hold a result to read it in full.</div>` : "";
+    const byKey = {}; shown.forEach(q=> byKey[`${q._paperId}::${q.id}`]=q);
+    document.getElementById("globalSearchResults").innerHTML = shown.map(q=>`<button type="button" class="check-item lp-target" data-qkey="${escapeHtml(q._paperId+"::"+q.id)}">
+      <span style="flex:1;min-width:0;"><div class="clamp2">${escapeHtml(q.question_text)}</div>
+      <div class="ci-sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div></span></button>`).join("");
+    const va = document.getElementById("viewAllResults");
+    if(va) va.addEventListener("click", ()=>{ closeModal(); pushScreen({ type:"search-results", term, scope:{ mode:sc.mode, ids:sc.ids.slice() } }); });
+    document.querySelectorAll("#globalSearchResults [data-qkey]").forEach(btn=> btn.addEventListener("click", ()=>{
+      const q = byKey[btn.dataset.qkey]; if(!q) return;
+      closeModal(); resetToTab("papers"); pushScreen({ type:"paper-detail", paperId:q._paperId });
+    }));
+    bindLongPress("#globalSearchResults [data-qkey]", el=>{ const q = byKey[el.dataset.qkey]; if(q) openQuestionPreview(q); });
+  }
+  document.querySelectorAll("#scopeSeg button").forEach(b=> b.addEventListener("click", ()=>{ sc.mode=b.dataset.m; setSearchScope(sc); drawScope(); drawResults(); }));
+  let tmr=null;
+  document.getElementById("globalSearchInput").addEventListener("input", e=>{ term=e.target.value; clearTimeout(tmr); tmr=setTimeout(drawResults,120); });
+  drawScope(); drawResults();
+  setTimeout(()=>{ const i=document.getElementById("globalSearchInput"); if(i) i.focus(); }, 50);
 }
 
 function openImportToBankModal(bankId){
@@ -2610,7 +3069,7 @@ function renderAttemptsForScope(groupBy, scopeKey, scopeLabel){
         sub: `${a.correctCount} correct · ${a.wrongCount} wrong · ${a.unansweredCount} unanswered${a.timerMinutes?` · timed ${a.timerMinutes}m${a.autoSubmitted?" (auto)":""}`:""}`,
         count: scoreLabel,
         dataAttr: `data-attempt-id="${escapeHtml(a.id)}"`
-      });
+      }).replace('<div class="count">', `<button class="delbtn" data-del-attempt="${escapeHtml(a.id)}" title="Delete this test">🗑</button><div class="count">`);
     });
     html += `</div>`;
   }
@@ -2619,6 +3078,13 @@ function renderAttemptsForScope(groupBy, scopeKey, scopeLabel){
   document.getElementById("backBtn").addEventListener("click", popScreen);
   document.querySelectorAll("#listWrap .row").forEach(row=>{
     row.addEventListener("click", ()=> pushScreen({ type:"attempt-review", attemptId: row.dataset.attemptId }));
+  });
+  document.querySelectorAll("[data-del-attempt]").forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      if(!confirm("Delete this test attempt? Its results will be removed from Attempts and Stats.")) return;
+      deleteAttemptById(btn.dataset.delAttempt); render(); toast("Test deleted");
+    });
   });
 }
 
@@ -2636,39 +3102,67 @@ function renderAttemptReviewScreen(attemptId){
     counts: attempt,
     netScore: attempt.netScore,
     marking: attempt.marking,
-    screen
+    screen,
+    extraActionsHtml: `<div style="display:flex;gap:8px;margin:12px 0 4px;"><button class="iconbtn bad" id="delAttemptBtn" style="flex:1;justify-content:center;">🗑 Delete this test</button></div>`,
+    bindExtra: ()=>{
+      document.getElementById("delAttemptBtn").addEventListener("click", ()=>{
+        if(!confirm("Delete this test attempt? Its results will be removed from Attempts and Stats.")) return;
+        deleteAttemptById(attemptId); popScreen(); toast("Test deleted");
+      });
+    }
   });
 }
 
 /* ================= Stats tab ================= */
+/* ---- Stats foundations: reset baseline, counting basis, sample-size smoothing ---- */
+const STATS_BASIS_KEY = "psev_stats_basis";
+function getStatsBasis(){ const v = localStorage.getItem(STATS_BASIS_KEY); return (v==="latest"||v==="all") ? v : "first"; }
+function setStatsBasis(v){ localStorage.setItem(STATS_BASIS_KEY, v); }
+function getStatsResetAt(){ return Number(DATA.statsResetAt)||0; }
+function statsAttempts(){
+  const cur = getCurrentSyllabusId(), base = getStatsResetAt();
+  return (DATA.attempts||[]).filter(a=> (a.type==="bank" || a.syllabus_id===cur) && new Date(a.timestamp).getTime()>=base);
+}
+const isAnsweredGraded = r=> !!r.isGraded && r.selectedIndex!==null && r.selectedIndex!==undefined;
+const hasTimeRec = r=> r.timeMs>0;
+/* One record per question for "first"/"latest"; every record for "all". */
+function pickByBasis(recs, pred){
+  const basis = getStatsBasis();
+  const ok = recs.filter(pred);
+  if(basis==="all") return ok;
+  const m = new Map();
+  ok.forEach(r=>{ const k = r.paperId+"::"+r.qid; if(basis==="first"){ if(!m.has(k)) m.set(k,r); } else m.set(k,r); });
+  return Array.from(m.values());
+}
+/* Shrinks small samples toward the overall accuracy so 1/1 never outranks 40/50. */
+const STATS_SHRINK_K = 5, STATS_LOW_N = 5;
+function adjustedAcc(correct, total, prior){
+  return (correct + STATS_SHRINK_K*prior) / (total + STATS_SHRINK_K);
+}
+function attachAdjusted(map){
+  let c=0,t=0; Object.values(map).forEach(a=>{ c+=a.correct; t+=a.total; });
+  const prior = t? c/t : 0.5;
+  Object.values(map).forEach(a=>{ a.adj = adjustedAcc(a.correct, a.total, prior); a.low = a.total < STATS_LOW_N; });
+  return map;
+}
 function computeAccuracyBySubject(){
-  const cur = getCurrentSyllabusId();
   const bySubj = {};
-  (DATA.attempts||[]).forEach(a=>{
-    if(a.type!=="bank" && a.syllabus_id!==cur) return;
-    a.answers.forEach(rec=>{
-      if(!rec.isGraded) return;
-      if(!bySubj[rec.subject]) bySubj[rec.subject] = {correct:0,total:0};
-      bySubj[rec.subject].total++;
-      if(rec.isCorrect) bySubj[rec.subject].correct++;
-    });
+  pickByBasis(collectAttemptRecords(), isAnsweredGraded).forEach(rec=>{
+    if(!bySubj[rec.subject]) bySubj[rec.subject] = {correct:0,total:0};
+    bySubj[rec.subject].total++;
+    if(rec.isCorrect) bySubj[rec.subject].correct++;
   });
-  return bySubj;
+  return attachAdjusted(bySubj);
 }
 function computeAccuracyByTopic(){
-  const cur = getCurrentSyllabusId();
   const byTopic = {};
-  (DATA.attempts||[]).forEach(a=>{
-    if(a.type!=="bank" && a.syllabus_id!==cur) return;
-    a.answers.forEach(rec=>{
-      if(!rec.isGraded) return;
-      const key = `${rec.subject}|||${rec.topic}`;
-      if(!byTopic[key]) byTopic[key] = {subject:rec.subject, topic:rec.topic, correct:0,total:0};
-      byTopic[key].total++;
-      if(rec.isCorrect) byTopic[key].correct++;
-    });
+  pickByBasis(collectAttemptRecords(), isAnsweredGraded).forEach(rec=>{
+    const key = `${rec.subject}|||${rec.topic}`;
+    if(!byTopic[key]) byTopic[key] = {subject:rec.subject, topic:rec.topic, correct:0,total:0};
+    byTopic[key].total++;
+    if(rec.isCorrect) byTopic[key].correct++;
   });
-  return byTopic;
+  return attachAdjusted(byTopic);
 }
 function computeQuestionCountsBySubject(){
   const counts = {};
@@ -2693,7 +3187,7 @@ function computePriorityList(){
     const freq = subjCounts[subject];
     const acc = subjAcc[subject];
     const practiced = !!acc && acc.total>0;
-    const accuracy = practiced ? acc.correct/acc.total : null;
+    const accuracy = practiced ? acc.adj : null;
     const priority = (freq/maxSubjCount) * (practiced ? (1-accuracy) : 1);
     return { level:"subject", label: subject, freq, practiced, accuracy, priority };
   });
@@ -2702,7 +3196,7 @@ function computePriorityList(){
     const freq = topicCounts[key];
     const acc = topicAcc[key];
     const practiced = !!acc && acc.total>0;
-    const accuracy = practiced ? acc.correct/acc.total : null;
+    const accuracy = practiced ? acc.adj : null;
     const priority = (freq/maxTopicCount) * (practiced ? (1-accuracy) : 1);
     return { level:"topic", label: topic, sublabel: subject, freq, practiced, accuracy, priority };
   });
@@ -2712,18 +3206,13 @@ function computePriorityList(){
   };
 }
 function computeTimeStats(){
-  const cur = getCurrentSyllabusId();
   const bySubject = {}, byTopic = {};
-  (DATA.attempts||[]).forEach(a=>{
-    if(a.type!=="bank" && a.syllabus_id!==cur) return;
-    a.answers.forEach(rec=>{
-      if(!rec.timeMs || rec.timeMs<=0) return;
-      if(!bySubject[rec.subject]) bySubject[rec.subject] = {totalMs:0,count:0};
-      bySubject[rec.subject].totalMs += rec.timeMs; bySubject[rec.subject].count++;
-      const key = `${rec.subject}|||${rec.topic}`;
-      if(!byTopic[key]) byTopic[key] = {subject:rec.subject, topic:rec.topic, totalMs:0, count:0};
-      byTopic[key].totalMs += rec.timeMs; byTopic[key].count++;
-    });
+  pickByBasis(collectAttemptRecords(), hasTimeRec).forEach(rec=>{
+    if(!bySubject[rec.subject]) bySubject[rec.subject] = {totalMs:0,count:0};
+    bySubject[rec.subject].totalMs += rec.timeMs; bySubject[rec.subject].count++;
+    const key = `${rec.subject}|||${rec.topic}`;
+    if(!byTopic[key]) byTopic[key] = {subject:rec.subject, topic:rec.topic, totalMs:0, count:0};
+    byTopic[key].totalMs += rec.timeMs; byTopic[key].count++;
   });
   return { bySubject, byTopic };
 }
@@ -2793,17 +3282,15 @@ function bindStatsQuickActions(){
 
 /* ================= Stats (sub-tabbed) ================= */
 const STATS_TABS = [
-  ["overview","Overview"],["subjects","Subjects"],["time","Time"],["difficulty","Difficulty"],["guess","Guesswork"]
+  ["overview","Overview"],["subjects","Subjects"],["bylevel","Right/Wrong by level"],["time","Time"],["difficulty","Difficulty"],["guess","Guesswork"]
 ];
 function collectAttemptRecords(){
-  const cur = getCurrentSyllabusId();
   const idx = buildQuestionIndex();
   const out = [];
-  (DATA.attempts||[]).forEach(a=>{
-    if(a.type!=="bank" && a.syllabus_id!==cur) return;
+  statsAttempts().slice().sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp)).forEach(a=>{
     (a.answers||[]).forEach(rec=>{
       const q = idx[`${rec.paperId}::${rec.qid}`];
-      out.push(Object.assign({}, rec, { difficulty: rec.difficulty || (q && q.difficulty) || null }));
+      out.push(Object.assign({}, rec, { ts: new Date(a.timestamp).getTime(), attemptId:a.id, difficulty: rec.difficulty || (q && q.difficulty) || null }));
     });
   });
   return out;
@@ -2836,8 +3323,8 @@ function barRowsHtml(entries, colorFn, valFn){
 
 function statsOverviewHtml(attempts){
   const totalAttempts = attempts.length;
-  let totalGraded=0, totalCorrect=0;
-  attempts.forEach(a=>{ a.answers.forEach(r=>{ if(r.isGraded){ totalGraded++; if(r.isCorrect) totalCorrect++; } }); });
+  const basisRecs = pickByBasis(collectAttemptRecords(), isAnsweredGraded);
+  const totalGraded = basisRecs.length, totalCorrect = basisRecs.filter(r=>r.isCorrect).length;
   const overallPct = totalGraded? Math.round(100*totalCorrect/totalGraded) : null;
   const { streak, today } = computeStreak();
   const wrongQs = collectWrongQuestions();
@@ -2901,12 +3388,12 @@ function statsSubjectsHtml(screen){
     const acc = subjAccMap[s];
     const practiced = !!acc && acc.total>0;
     return { subject:s, freq:subjCounts[s], practiced, pct: practiced? Math.round(100*acc.correct/acc.total):null,
-      answered: practiced?acc.total:0, diff: avgDifficulty(qs.filter(q=>q.subject===s)) };
+      answered: practiced?acc.total:0, adj: practiced?acc.adj:null, low: practiced&&acc.low, diff: avgDifficulty(qs.filter(q=>q.subject===s)) };
   });
-  if(sortMode==="strong") subjRows.sort((a,b)=> (b.pct===null?-1:b.pct) - (a.pct===null?-1:a.pct));
+  if(sortMode==="strong") subjRows.sort((a,b)=> (b.adj===null?-1:b.adj) - (a.adj===null?-1:a.adj));
   else if(sortMode==="most") subjRows.sort((a,b)=> b.freq-a.freq);
   else if(sortMode==="hard") subjRows.sort((a,b)=> (b.diff?b.diff.avg:0)-(a.diff?a.diff.avg:0));
-  else subjRows.sort((a,b)=> (a.pct===null?-1:a.pct) - (b.pct===null?-1:b.pct));
+  else subjRows.sort((a,b)=> (a.adj===null?-1:a.adj) - (b.adj===null?-1:b.adj));
   let html = `<div class="chart-block">
     <div class="chart-title">Subject performance — tap to see its topics</div>
     <button class="iconbtn" id="allTopicsBtn" style="width:100%;justify-content:center;margin:6px 0 10px;">📋 View all topics of all subjects</button>
@@ -2919,7 +3406,7 @@ function statsSubjectsHtml(screen){
   subjRows.forEach((r,idx)=>{
     html += `<div class="priority-row" style="cursor:pointer;" data-stats-subject="${escapeHtml(r.subject)}">
       <div class="pr-rank">${idx+1}</div>
-      <div class="pr-main"><div class="pr-title">${escapeHtml(r.subject)}</div><div class="pr-sub">${r.freq} q in bank${r.practiced?` · ${r.answered} answered`:""} ${diffBadgeSmall(r.diff)}</div></div>
+      <div class="pr-main"><div class="pr-title">${escapeHtml(r.subject)}</div><div class="pr-sub">${r.freq} q in bank${r.practiced?` · ${r.answered} answered${r.low?" ⚠ low data":""}`:""} ${diffBadgeSmall(r.diff)}</div></div>
       <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${r.practiced? r.pct+"%":"Not tried"}</span></div>`;
   });
   return html + `</div></div>`;
@@ -3017,22 +3504,95 @@ function statsGuessHtml(recs, screen){
   return html + `</div>`;
 }
 
+function pctOf(a,b){ return b? Math.round(100*a/b) : null; }
+function levelCounts(arr){
+  const r = arr.filter(x=>x.isCorrect).length;
+  return { right:r, wrong:arr.length-r, total:arr.length };
+}
+function statsByLevelHtml(recs){
+  if(!isDifficultyMarkingEnabled()) return `<div class="chart-note" style="margin:14px 2px;">Difficulty marking is switched off. Turn it on from ⚙️ below to analyse results by difficulty.</div>`;
+  if(!recs.length) return `<div class="chart-note" style="margin:14px 2px;">No answered questions yet in this stats window. Take a test to see this.</div>`;
+  const levels = [["E","Easy"],["M","Medium"],["D","Difficult"],[null,"Not marked"]];
+  const grp = aggregateBy(recs, r=> r.difficulty || "U");
+  let html = `<div class="chart-note">Counted on the “${getStatsBasis()==="first"?"first attempt":getStatsBasis()==="latest"?"latest attempt":"every attempt"}” basis · only answered questions are included.</div>
+    <div class="chart-block"><div class="chart-title">Right vs wrong by difficulty</div>
+    <table class="diff-table"><tr><th>Level</th><th>Right</th><th>Wrong</th><th>Right %</th><th>Wrong %</th></tr>`;
+  let tR=0,tW=0;
+  levels.forEach(([k,label])=>{
+    const c = levelCounts(grp[k||"U"]||[]); tR+=c.right; tW+=c.wrong;
+    if(!c.total && !k) return;
+    html += `<tr><td>${label}${c.total?` <span class="ai-sub">(${c.total})</span>`:""}</td><td style="color:var(--good)">${c.right}</td><td style="color:var(--bad)">${c.wrong}</td><td>${c.total?pctOf(c.right,c.total)+"%":"—"}</td><td>${c.total?pctOf(c.wrong,c.total)+"%":"—"}</td></tr>`;
+  });
+  html += `<tr><td><b>All</b></td><td><b>${tR}</b></td><td><b>${tW}</b></td><td><b>${pctOf(tR,tR+tW)}%</b></td><td><b>${pctOf(tW,tR+tW)}%</b></td></tr></table></div>`;
+  const cell = (arr,d)=>{ const x=(arr||[]).filter(r=>r.difficulty===d); if(!x.length) return "—"; const c=levelCounts(x); return `${c.right}/${c.wrong}<br><span class="ai-sub">${pctOf(c.right,c.total)}%</span>`; };
+  const tbl = (groups,labelFn)=>`<div style="max-height:340px;overflow:auto;"><table class="diff-table"><tr><th>&nbsp;</th><th>Easy<br><span class="ai-sub">R/W</span></th><th>Med<br><span class="ai-sub">R/W</span></th><th>Hard<br><span class="ai-sub">R/W</span></th></tr>${
+    Object.entries(groups).sort((a,b)=>b[1].length-a[1].length).map(([k,a])=>`<tr><td>${escapeHtml(labelFn(k))}</td><td>${cell(a,"E")}</td><td>${cell(a,"M")}</td><td>${cell(a,"D")}</td></tr>`).join("")}</table></div>`;
+  html += `<div class="chart-block"><div class="chart-title">By subject (right/wrong · right %)</div>${tbl(aggregateBy(recs,r=>r.subject),k=>k)}</div>`;
+  html += `<div class="chart-block"><div class="chart-title">By topic (right/wrong · right %)</div>${tbl(aggregateBy(recs,r=>`${r.subject}|||${r.topic}`),k=>k.split("|||")[1]+" · "+k.split("|||")[0])}</div>`;
+  return html;
+}
+
+function statsBasisBlockHtml(){
+  const b = getStatsBasis();
+  const since = getStatsResetAt() ? `Counting tests since ${new Date(getStatsResetAt()).toLocaleDateString()}. ` : "";
+  return `<div class="chart-block" style="margin:10px 0;">
+    <div class="chart-title" style="font-size:0.85rem;">How questions are counted</div>
+    <div class="segmented" id="basisSeg">
+      <button data-b="first" class="${b==='first'?'active':''}">First attempt</button>
+      <button data-b="latest" class="${b==='latest'?'active':''}">Latest attempt</button>
+      <button data-b="all" class="${b==='all'?'active':''}">All attempts</button>
+    </div>
+    <div class="chart-note">${since}Tests have different sizes, and the same question can appear in many tests. <b>First attempt</b> (recommended) counts each question once — your cold knowledge — so topic, subject, exam and custom tests all weigh the same and repeated practice can’t inflate or deflate %. Only answered questions count. Rankings use a small-sample adjustment, and ⚠ marks topics with fewer than ${STATS_LOW_N} answers.</div>
+  </div>`;
+}
+function openResetStatsModal(){
+  modalRoot.innerHTML = `<div class="modal-backdrop" id="backdrop"><div class="modal">
+    <h3>Start fresh stats</h3>
+    <div class="chart-note">Your papers, questions, notes, labels, topic lists, banks and study counts are never touched.</div>
+    <div class="field"><button class="iconbtn primary" id="resetKeep" style="width:100%;justify-content:center;">Reset stats — keep test history</button>
+      <div class="chart-note">Stats start from zero now. Old tests stay in the Attempts tab and can be deleted one by one.</div></div>
+    <div class="field"><button class="iconbtn bad" id="resetDel" style="width:100%;justify-content:center;">Reset stats AND delete all test history</button>
+      <div class="chart-note">Permanently removes every saved test attempt. Also clears the wrong-answer queue.</div></div>
+    <div class="row-btns"><button class="iconbtn" id="resetCancel" style="flex:1;justify-content:center;">Cancel</button></div>
+  </div></div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("resetCancel").addEventListener("click", closeModal);
+  document.getElementById("resetKeep").addEventListener("click", ()=>{
+    if(!confirm("Reset stats from now on? Test history is kept.")) return;
+    DATA.statsResetAt = Date.now(); saveData(DATA); closeModal(); render(); toast("Stats reset");
+  });
+  document.getElementById("resetDel").addEventListener("click", ()=>{
+    if(!confirm("Delete ALL test attempts permanently? This can't be undone.")) return;
+    DATA.attempts = []; DATA.statsResetAt = Date.now(); saveData(DATA); closeModal(); render(); toast("Stats and test history deleted");
+  });
+}
+function deleteAttemptById(id){
+  DATA.attempts = (DATA.attempts||[]).filter(a=>a.id!==id);
+  saveData(DATA);
+}
+
 function renderStatsScreen(){
   const screen = currentScreen();
   const cur = getCurrentSyllabusId();
   const tab = screen.statsTab || "overview";
-  const attempts = (DATA.attempts||[]).filter(a=> a.type==="bank" || a.syllabus_id===cur);
-  const recs = collectAttemptRecords();
+  const attempts = statsAttempts();
+  const allRecs = collectAttemptRecords();
+  const answeredRecs = pickByBasis(allRecs, isAnsweredGraded);
   let html = `<div class="detail-head"><div style="width:100%"><h2>Performance</h2><div class="meta">${escapeHtml(getSyllabusById(cur).name)} syllabus</div></div></div>`;
   html += statsTabBarHtml(tab);
+  html += statsBasisBlockHtml();
   if(tab==="overview") html += statsOverviewHtml(attempts);
   else if(tab==="subjects") html += statsSubjectsHtml(screen);
-  else if(tab==="time") html += statsTimeHtml(recs);
-  else if(tab==="difficulty") html += statsDifficultyHtml(recs);
-  else if(tab==="guess") html += statsGuessHtml(recs, screen);
+  else if(tab==="bylevel") html += statsByLevelHtml(answeredRecs);
+  else if(tab==="time") html += statsTimeHtml(pickByBasis(allRecs, hasTimeRec));
+  else if(tab==="difficulty") html += statsDifficultyHtml(answeredRecs);
+  else if(tab==="guess") html += statsGuessHtml(pickByBasis(allRecs, r=>r.guessed && isAnsweredGraded(r)), screen);
   const on = isDifficultyMarkingEnabled();
-  html += `<div class="chart-block" style="margin-top:18px;"><label class="switch-row"><input type="checkbox" id="diffSwitch" ${on?"checked":""}> ⚙️ Allow difficulty marking (E / M / D) on questions</label></div>`;
+  html += `<div class="chart-block" style="margin-top:18px;"><label class="switch-row"><input type="checkbox" id="diffSwitch" ${on?"checked":""}> ⚙️ Allow difficulty marking (E / M / D) on questions</label></div>
+    <button class="iconbtn bad" id="resetStatsBtn" style="width:100%;justify-content:center;margin-top:10px;">🧹 Start fresh stats…</button>`;
   mainEl.innerHTML = html;
+  document.querySelectorAll("#basisSeg button").forEach(b=> b.addEventListener("click", ()=>{ setStatsBasis(b.dataset.b); render(); }));
+  document.getElementById("resetStatsBtn").addEventListener("click", openResetStatsModal);
   document.querySelectorAll("#statsTabSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.statsTab = b.dataset.t; render(); }));
   document.getElementById("diffSwitch").addEventListener("change", e=>{ setDifficultyMarkingEnabled(e.target.checked); toast(e.target.checked?"Difficulty marking on":"Difficulty marking off"); render(); });
   if(tab==="overview"){
@@ -3064,13 +3624,13 @@ function renderStatsAllTopics(){
     const acc = topicAccMap[k];
     const practiced = !!acc && acc.total>0;
     return { subject, topic, freq: topicCounts[k], practiced, pct: practiced? Math.round(100*acc.correct/acc.total):null,
-      diff: avgDifficulty(qs.filter(q=>q.subject===subject && (q.topic||FALLBACK_TOPIC)===topic)) };
+      adj: practiced?acc.adj:null, n: practiced?acc.total:0, low: practiced&&acc.low, diff: avgDifficulty(qs.filter(q=>q.subject===subject && (q.topic||FALLBACK_TOPIC)===topic)) };
   });
-  if(sortMode==="strong") rows.sort((a,b)=> (b.pct===null?-1:b.pct)-(a.pct===null?-1:a.pct));
+  if(sortMode==="strong") rows.sort((a,b)=> (b.adj===null?-1:b.adj)-(a.adj===null?-1:a.adj));
   else if(sortMode==="most") rows.sort((a,b)=> b.freq-a.freq);
   else if(sortMode==="hard") rows.sort((a,b)=> (b.diff?b.diff.avg:0)-(a.diff?a.diff.avg:0));
   else if(sortMode==="az") rows.sort((a,b)=> a.topic.localeCompare(b.topic));
-  else rows.sort((a,b)=> (a.pct===null?-1:a.pct)-(b.pct===null?-1:b.pct));
+  else rows.sort((a,b)=> (a.adj===null?-1:a.adj)-(b.adj===null?-1:b.adj));
   let html = `<div class="detail-head"><div style="width:100%"><div class="backrow" id="backBtn">‹ Back to Stats</div>
     <h2>All topics</h2><div class="meta">${rows.length} topics across all subjects</div></div></div>
     <div class="segmented" id="allSortSeg">
@@ -3082,7 +3642,7 @@ function renderStatsAllTopics(){
   rows.forEach((r,idx)=>{
     html += `<div class="priority-row" style="cursor:pointer;" data-subj="${escapeHtml(r.subject)}" data-topic="${escapeHtml(r.topic)}">
       <div class="pr-rank">${idx+1}</div>
-      <div class="pr-main"><div class="pr-title">${escapeHtml(r.topic)} ${labelPillHtml(r.subject,r.topic)}</div><div class="pr-sub">${escapeHtml(r.subject)} · ${r.freq} q ${diffBadgeSmall(r.diff)}</div></div>
+      <div class="pr-main"><div class="pr-title">${escapeHtml(r.topic)} ${labelPillHtml(r.subject,r.topic)}</div><div class="pr-sub">${escapeHtml(r.subject)} · ${r.freq} q${r.practiced?` · ${r.n} answered${r.low?" ⚠":""}`:""} ${diffBadgeSmall(r.diff)}</div></div>
       <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${r.practiced? r.pct+"%":"Not tried"}</span></div>`;
   });
   mainEl.innerHTML = html + `</div>`;
@@ -3101,12 +3661,12 @@ function renderStatsSubject(subject){
     const acc = topicAccMap[k];
     const practiced = !!acc && acc.total>0;
     const pct = practiced ? Math.round(100*acc.correct/acc.total) : null;
-    return { topic, freq: topicCounts[k], practiced, pct, studied: getStudyCount(subject,topic), attemptCount: countTopicAttempts(subject,topic) };
+    return { topic, freq: topicCounts[k], practiced, pct, adj: practiced?acc.adj:null, n: practiced?acc.total:0, low: practiced&&acc.low, studied: getStudyCount(subject,topic), attemptCount: countTopicAttempts(subject,topic) };
   });
 
-  if(sortMode==="strong") rows.sort((a,b)=> (b.pct===null?-1:b.pct)-(a.pct===null?-1:a.pct));
+  if(sortMode==="strong") rows.sort((a,b)=> (b.adj===null?-1:b.adj)-(a.adj===null?-1:a.adj));
   else if(sortMode==="most") rows.sort((a,b)=> b.freq-a.freq);
-  else rows.sort((a,b)=> (a.pct===null?-1:a.pct)-(b.pct===null?-1:b.pct));
+  else rows.sort((a,b)=> (a.adj===null?-1:a.adj)-(b.adj===null?-1:b.adj));
 
   let html = `<div class="detail-head">
     <div style="width:100%">
@@ -3128,6 +3688,7 @@ function renderStatsSubject(subject){
     rows.forEach((r,idx)=>{
       const pctLabel = r.practiced ? r.pct+"%" : "Not tried";
       const bits = [`${r.freq} q`];
+      if(r.practiced) bits.push(`${r.n} answered${r.low?" ⚠":""}`);
       if(r.studied) bits.push(`📖 ${r.studied}×`);
       if(r.attemptCount) bits.push(`📝 ${r.attemptCount}`);
       html += `<div class="priority-row" style="cursor:pointer;" data-stats-topic="${escapeHtml(r.topic)}">
@@ -3164,135 +3725,60 @@ function renderFlaggedList(){
 
 /* ================= Notes tab ================= */
 function renderNotesRoot(){
-  const searchTerm = getSearch();
-  const notedAll = collectNotedQuestions().filter(q=>(q._syllabusId||"default")===getCurrentSyllabusId());
-  const noted = searchTerm ? notedAll.filter(q=> q.note.toLowerCase().includes(searchTerm.toLowerCase()) || q.question_text.toLowerCase().includes(searchTerm.toLowerCase())) : notedAll;
+  const searchTerm = getSearch().toLowerCase();
+  const notes = Object.entries(DATA.listingNotes||{}).map(([key,n])=>Object.assign({key},n))
+    .filter(n=> n.text && (!searchTerm || n.text.toLowerCase().includes(searchTerm) || (n.label||"").toLowerCase().includes(searchTerm)))
+    .sort((a,b)=> (b.updatedAt||0)-(a.updatedAt||0));
+  const legacyAll = collectNotedQuestions().filter(q=>(q._syllabusId||"default")===getCurrentSyllabusId());
+  const legacy = searchTerm ? legacyAll.filter(q=> q.note.toLowerCase().includes(searchTerm) || q.question_text.toLowerCase().includes(searchTerm)) : legacyAll;
 
-  if(notedAll.length===0){
-    mainEl.innerHTML = emptyState("No notes yet", "Tap the 📄/🗒️ icon on any question to jot down your thoughts — they'll all show up here.");
+  if(Object.keys(DATA.listingNotes||{}).length===0 && legacyAll.length===0){
+    mainEl.innerHTML = emptyState("No notes yet", "Open any paper, subject, topic, bank or topic list and tap “📝 My note” — each listing has one note, and they all show up here with a link back.");
     return;
   }
-  let html = `<input class="search" id="searchBox" placeholder="Search notes…" value="${escapeHtml(searchTerm)}">`;
+  let html = `<input class="search" id="searchBox" placeholder="Search notes…" value="${escapeHtml(getSearch())}">`;
   html += `<div id="listWrap">`;
-  noted.forEach((q, idx)=>{
-    html += `<div class="row" data-paper-id="${escapeHtml(q._paperId)}" data-qid="${escapeHtml(q.id)}">
+  notes.forEach((n, idx)=>{
+    html += `<div class="row" data-note-key="${escapeHtml(n.key)}">
       <div class="num">${String(idx+1).padStart(2,"0")}</div>
       <div class="main">
-        <div class="title">${escapeHtml(q.note.slice(0,70))}${q.note.length>70?"…":""}</div>
-        <div class="sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div>
+        <div class="title">${escapeHtml(n.label||n.key)}</div>
+        <div class="sub" style="white-space:pre-wrap;">${escapeHtml(n.text.slice(0,140))}${n.text.length>140?"…":""}</div>
       </div>
-      <div class="count">→</div>
+      <button class="actbtn" data-edit-note="${escapeHtml(n.key)}" title="Edit note">✎</button>
+      <div class="count">${n.nav?"→":""}</div>
     </div>`;
   });
   html += `</div>`;
+  if(legacy.length){
+    html += `<div class="chart-title" style="margin:18px 0 6px;">Older per-question notes (${legacy.length})</div><div class="chart-note">Notes are now kept per listing. These older question notes are preserved here.</div><div id="legacyWrap">`;
+    legacy.forEach((q, idx)=>{
+      html += `<div class="row" data-paper-id="${escapeHtml(q._paperId)}">
+        <div class="num">${String(idx+1).padStart(2,"0")}</div>
+        <div class="main"><div class="title">${escapeHtml(q.note.slice(0,70))}${q.note.length>70?"…":""}</div>
+        <div class="sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div></div>
+        <div class="count">→</div></div>`;
+    });
+    html += `</div>`;
+  }
   mainEl.innerHTML = html;
+  const byKey = k => (DATA.listingNotes||{})[k];
   document.querySelectorAll("#listWrap .row").forEach(row=>{
-    row.addEventListener("click", ()=> pushScreen({ type:"paper-detail", paperId: row.dataset.paperId }));
+    row.addEventListener("click", ()=>{
+      const n = byKey(row.dataset.noteKey);
+      if(n && n.nav) pushScreen(Object.assign({}, n.nav));
+      else if(n) openListingNoteModal({ key:row.dataset.noteKey, label:n.label, nav:n.nav });
+    });
   });
+  document.querySelectorAll("[data-edit-note]").forEach(b=> b.addEventListener("click", (e)=>{
+    e.stopPropagation(); const n = byKey(b.dataset.editNote); if(n) openListingNoteModal({ key:b.dataset.editNote, label:n.label, nav:n.nav });
+  }));
+  document.querySelectorAll("#legacyWrap .row").forEach(row=> row.addEventListener("click", ()=> pushScreen({ type:"paper-detail", paperId: row.dataset.paperId })));
   bindSearchInput(renderNotesRoot);
 }
 
 /* ================= Topic priority lists ================= */
-function renderTopicListsRoot(){
-  const lists = DATA.topicLists||[];
-  let html = `<div style="display:flex;gap:8px;margin-bottom:10px;">
-    <button class="iconbtn primary" id="newListBtn" style="flex:1;justify-content:center;">+ New list</button>
-  </div>`;
-  if(lists.length===0){
-    html += emptyState("No topic lists yet", "Create a named list (e.g. \"Must revise before exam\") and add topics to it from across your syllabus.");
-  } else {
-    html += `<div id="listWrap">`;
-    lists.forEach((l, idx)=>{
-      html += rowHtml({
-        num: String(idx+1).padStart(2,"0"),
-        title: l.name,
-        sub: `${l.items.length} topic${l.items.length===1?"":"s"}`,
-        count: "→",
-        dataAttr: `data-list-id="${escapeHtml(l.id)}"`
-      });
-    });
-    html += `</div>`;
-  }
-  mainEl.innerHTML = html;
-  document.getElementById("newListBtn").addEventListener("click", ()=>{
-    const name = prompt("Name this topic list");
-    if(name && name.trim()){
-      const list = { id: slugify(name), name: name.trim(), items: [] };
-      DATA.topicLists.push(list);
-      saveData(DATA);
-      pushScreen({ type:"topic-list-detail", listId: list.id });
-    }
-  });
-  document.querySelectorAll("#listWrap .row").forEach(row=>{
-    row.addEventListener("click", ()=> pushScreen({ type:"topic-list-detail", listId: row.dataset.listId }));
-  });
-}
 
-function renderTopicListDetail(listId){
-  const list = findTopicList(listId);
-  if(!list){ popScreen(); return; }
-  const qs = visibleQuestions();
-  const counts = {};
-  qs.forEach(q=>{ const k=`${q.subject}|||${q.topic||FALLBACK_TOPIC}`; counts[k]=(counts[k]||0)+1; });
-
-  let html = `<div class="detail-head">
-    <div style="width:100%">
-      <div class="backrow" id="backBtn">‹ Back to My lists</div>
-      <h2>${escapeHtml(list.name)}</h2>
-      <div class="meta">${list.items.length} topic${list.items.length===1?"":"s"}</div>
-    </div>
-  </div>`;
-  html += `<div style="display:flex;gap:8px;margin:10px 0;">
-    <button class="iconbtn" id="renameListBtn" style="flex:1;justify-content:center;">Rename</button>
-    <button class="iconbtn" id="addTopicsBtn" style="flex:1;justify-content:center;">+ Add topics</button>
-    <button class="iconbtn" id="deleteListBtn" style="border-color:var(--maroon);color:#f0a3ab;">🗑</button>
-  </div>`;
-
-  if(list.items.length===0){
-    html += emptyState("No topics in this list yet", "");
-  } else {
-    html += `<div id="listWrap">`;
-    list.items.forEach((it, idx)=>{
-      const key = `${it.subject}|||${it.topic}`;
-      html += `<div class="row" data-subject="${escapeHtml(it.subject)}" data-topic="${escapeHtml(it.topic)}">
-        <div class="num">${String(idx+1).padStart(2,"0")}</div>
-        <div class="main">
-          <div class="title">${escapeHtml(it.topic)}</div>
-          <div class="sub">${escapeHtml(it.subject)}</div>
-        </div>
-        <div class="count">${counts[key]||0} q</div>
-        <button class="actbtn danger" data-remove-item="${escapeHtml(key)}" title="Remove from list">✕</button>
-      </div>`;
-    });
-    html += `</div>`;
-  }
-
-  mainEl.innerHTML = html;
-  document.getElementById("backBtn").addEventListener("click", popScreen);
-  document.getElementById("renameListBtn").addEventListener("click", ()=>{
-    const name = prompt("Rename list", list.name);
-    if(name && name.trim()){ list.name = name.trim(); saveData(DATA); render(); }
-  });
-  document.getElementById("deleteListBtn").addEventListener("click", ()=>{
-    if(confirm(`Delete the list "${list.name}"? This doesn't affect the topics or questions themselves.`)){
-      DATA.topicLists = DATA.topicLists.filter(l=>l.id!==listId);
-      saveData(DATA);
-      popScreen();
-    }
-  });
-  document.getElementById("addTopicsBtn").addEventListener("click", ()=> openTopicListPickerModal(listId));
-  document.querySelectorAll("[data-remove-item]").forEach(btn=>{
-    btn.addEventListener("click", (e)=>{
-      e.stopPropagation();
-      const [subject, topic] = btn.dataset.removeItem.split("|||");
-      removeTopicFromList(listId, subject, topic);
-      render();
-    });
-  });
-  document.querySelectorAll("#listWrap .row").forEach(row=>{
-    row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: row.dataset.subject, topic: row.dataset.topic }));
-  });
-}
 
 function openTopicListPickerModal(listId){
   const qs = visibleQuestions();
@@ -3491,52 +3977,6 @@ function openMockExamModal(){
 }
 
 /* ---- Global search across every syllabus and paper ---- */
-function openGlobalSearchModal(){
-  let term = "";
-  const all = allQuestions();
-  function results(){
-    if(!term.trim()) return [];
-    const t = term.toLowerCase();
-    return all.filter(q=> q.question_text.toLowerCase().includes(t) || q.subject.toLowerCase().includes(t) || (q.topic||"").toLowerCase().includes(t) || q._paperName.toLowerCase().includes(t)).slice(0,80);
-  }
-  function draw(){
-    const list = results();
-    modalRoot.innerHTML = `
-    <div class="modal-backdrop" id="backdrop">
-      <div class="modal">
-        <h3>Search all questions</h3>
-        <input class="search" id="globalSearchInput" placeholder="Search text, subject, topic, paper…" value="${escapeHtml(term)}">
-        <div class="meta" style="margin:6px 0;">${term.trim() ? `${list.length} match${list.length===1?"":"es"} (showing up to 80)` : "Across every syllabus and paper"}</div>
-        <div id="globalSearchResults" style="max-height:50vh;overflow-y:auto;">
-          ${list.map(q=>`<button type="button" class="check-item" data-open-paper="${escapeHtml(q._paperId)}">
-            <span style="flex:1;">
-              <div style="font-size:0.85rem;">${escapeHtml(q.question_text.slice(0,110))}${q.question_text.length>110?"…":""}</div>
-              <div class="ci-sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div>
-            </span>
-          </button>`).join("")}
-        </div>
-        <div class="row-btns"><button class="iconbtn" id="closeSearch" style="width:100%;justify-content:center;">Close</button></div>
-      </div>
-    </div>`;
-    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
-    document.getElementById("closeSearch").addEventListener("click", closeModal);
-    document.getElementById("globalSearchInput").addEventListener("input",(e)=>{
-      const pos = e.target.selectionStart;
-      term = e.target.value; draw();
-      const nb = document.getElementById("globalSearchInput");
-      if(nb){ nb.focus(); nb.setSelectionRange(pos,pos); }
-    });
-    document.querySelectorAll("[data-open-paper]").forEach(btn=>{
-      btn.addEventListener("click", ()=>{
-        const paperId = btn.dataset.openPaper;
-        closeModal();
-        resetToTab("papers");
-        pushScreen({ type:"paper-detail", paperId });
-      });
-    });
-  }
-  draw();
-}
 
 /* ================= Topic reassignment modal ================= */
 function openTopicEditor(paperId, qid, currentSubject, currentTopic){
@@ -4240,7 +4680,9 @@ function openDataModal(){
         topicLists: Array.isArray(pendingImportData.topicLists) ? pendingImportData.topicLists : (DATA.topicLists||[]),
         topicLabels: (pendingImportData.topicLabels && typeof pendingImportData.topicLabels==="object") ? pendingImportData.topicLabels : (DATA.topicLabels||{}),
         studyProgress: (pendingImportData.studyProgress && typeof pendingImportData.studyProgress==="object") ? pendingImportData.studyProgress : (DATA.studyProgress||{}),
-        dailyActivity: (pendingImportData.dailyActivity && typeof pendingImportData.dailyActivity==="object") ? pendingImportData.dailyActivity : (DATA.dailyActivity||{})
+        dailyActivity: (pendingImportData.dailyActivity && typeof pendingImportData.dailyActivity==="object") ? pendingImportData.dailyActivity : (DATA.dailyActivity||{}),
+        listingNotes: (pendingImportData.listingNotes && typeof pendingImportData.listingNotes==="object") ? pendingImportData.listingNotes : (DATA.listingNotes||{}),
+        statsResetAt: pendingImportData.statsResetAt || DATA.statsResetAt || 0
       };
     } else {
       const byId = {};
@@ -4256,7 +4698,8 @@ function openDataModal(){
       }
       DATA = {
         papers: Object.values(byId), attempts, banks: DATA.banks||[], syllabuses: DATA.syllabuses, paperTemplates: DATA.paperTemplates||[],
-        topicLists: DATA.topicLists||[], topicLabels: DATA.topicLabels||{}, studyProgress: DATA.studyProgress||{}, dailyActivity: DATA.dailyActivity||{}
+        topicLists: DATA.topicLists||[], topicLabels: DATA.topicLabels||{}, studyProgress: DATA.studyProgress||{}, dailyActivity: DATA.dailyActivity||{},
+        listingNotes: Object.assign({}, DATA.listingNotes||{}, pendingImportData.listingNotes||{}), statsResetAt: DATA.statsResetAt||0
       };
     }
     DATA = loadDataFromObject(DATA);
@@ -4273,6 +4716,7 @@ function loadDataFromObject(parsed){
   if(!Array.isArray(parsed.paperTemplates)) parsed.paperTemplates = [];
   if(!Array.isArray(parsed.topicLists)) parsed.topicLists = [];
   if(!parsed.topicLabels || typeof parsed.topicLabels !== "object") parsed.topicLabels = {};
+  if(!parsed.listingNotes || typeof parsed.listingNotes !== "object") parsed.listingNotes = {};
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
   migrateStudyProgress(parsed.studyProgress);
   if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};

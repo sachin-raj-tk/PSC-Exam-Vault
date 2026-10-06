@@ -116,3 +116,12 @@ Tap **🤖** next to the syllabus button → add presets (OpenRouter, Gemini, Gr
 - **Stats → Overview → AI tools:** study plan from your weak, slow and guess-heavy topics; memory tricks for wrong answers.
 - **Stats → Guesswork → AI guess coach.**
 AI output can be wrong — verify facts before relying on it. Model names change; edit them in the preset.
+
+## Update: lists, notes, search, stats accuracy
+- **Topics tab:** sort by Frequency / A–Z / **Studied** (filter: not studied, studied, 3+; most/least first) / **Label** (colour chips: tap one to see only that colour, tap more to add) / **📌 My lists** (list names as a scrolling chip bar, tap one to see its topics). Press and hold any topic to add it to a list or give it a label.
+- **My note per listing** (paper, subject, topic, bank, flagged, topic list) — one note each, all collected in the Notes tab with a link back. Old per-question notes are kept in the Notes tab.
+- **Question bank:** filters (syllabus, subject, topic, paper) and search in the add-questions picker; press and hold a question to read it fully; “✍️ Type a question” to write your own.
+- **Search:** choose this syllabus / all / pick syllabuses; “View all as a list” opens results like any listing (practice, sort, swipe).
+- **Exam picker:** search exams by name.
+- **Auto difficulty:** answered questions with no difficulty are marked Easy (<26s), Medium (26–50s) or Difficult (>50s); you can change it any time and it then stays as you set it. Paused/background time is never counted.
+- **Stats:** “Right/Wrong by level” tab; counting basis (first / latest / all attempts — default first attempt, each question counted once); small-sample adjustment and ⚠ low-data marks; delete a single test (Attempts); “Start fresh stats” keeps all other data.

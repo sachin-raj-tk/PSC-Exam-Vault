@@ -161,7 +161,7 @@ function aiResultActions(kind){
   return `<div class="row-btns" style="flex-wrap:wrap;">
     <button class="iconbtn" id="aiCopyBtn" style="flex:1;justify-content:center;">📋 Copy</button>
     ${kind==="q" ? `<button class="iconbtn" id="aiSaveExpl" style="flex:1;justify-content:center;">Save as explanation</button>
-    <button class="iconbtn" id="aiSaveNote" style="flex:1;justify-content:center;">Save to my note</button>` : ""}
+    <button class="iconbtn" id="aiSaveNote" style="flex:1;justify-content:center;">Add to listing note</button>` : ""}
   </div>`;
 }
 
@@ -301,8 +301,8 @@ function openAIQuestionModal(paperId, qid, selIdx){
           fresh.explanation = lastText; saveData(DATA); toast("Saved as explanation"); render();
         });
         document.getElementById("aiSaveNote").addEventListener("click", ()=>{
-          const fresh = aiFindQuestion(paperId, qid); if(!fresh) return;
-          fresh.note = ((fresh.note||"").trim() ? fresh.note.trim()+"\n\n" : "") + lastText; saveData(DATA); toast("Added to your note"); render();
+          const info = appendToListingNote(`🤖 ${snippet.slice(0,80)}\n${lastText}`);
+          toast("Added to the note of: "+info.label); render();
         });
       }catch(e){ aiShowError(out, e); }
     });
@@ -457,12 +457,12 @@ function openAIWrongMnemonicsModal(){
       const rows = arr.filter(x=>batch[Number(x.n)-1]).map(x=>({ q:batch[Number(x.n)-1], fact:String(x.fact||""), mn:String(x.mnemonic||"") }));
       out.innerHTML = rows.map((r,i)=>`<div class="ai-genq"><div class="qtext">${renderRichText(r.q.question_text.slice(0,120))}</div>
         <div><b>Fact:</b> ${renderRichText(r.fact)}</div>${r.mn?`<div><b>Trick:</b> ${renderRichText(r.mn)}</div>`:""}
-        <button class="iconbtn" data-save="${i}" style="margin-top:6px;">Save to note</button></div>`).join("")
+        <button class="iconbtn" data-save="${i}" style="margin-top:6px;">Save to notes</button></div>`).join("")
         + `<div class="row-btns"><button class="iconbtn primary" id="wmSaveAll" style="flex:1;justify-content:center;">Save all to notes</button></div>`;
       typesetMath(out);
-      const saveOne = r=>{ const fresh = aiFindQuestion(r.q._paperId, r.q.id); if(!fresh) return; const add = `🧠 ${r.fact}${r.mn?"\n"+r.mn:""}`; if((fresh.note||"").includes(add)) return; fresh.note = ((fresh.note||"").trim()?fresh.note.trim()+"\n\n":"")+add; };
+      const saveOne = r=>{ const add = `🧠 ${r.q.subject} › ${r.q.topic||""}: ${r.fact}${r.mn?"\n"+r.mn:""}`; const info = { key:"misc:ai", label:"AI notes & tricks", nav:null }; const cur = getListingNote(info.key); if(cur && cur.text.includes(add)) return; saveListingNote(info, (cur?cur.text+"\n\n":"")+add); };
       out.querySelectorAll("[data-save]").forEach(b=> b.addEventListener("click", ()=>{ saveOne(rows[Number(b.dataset.save)]); saveData(DATA); b.textContent="Saved ✓"; b.disabled=true; }));
-      document.getElementById("wmSaveAll").addEventListener("click", ()=>{ rows.forEach(saveOne); saveData(DATA); toast("Saved to notes"); render(); });
+      document.getElementById("wmSaveAll").addEventListener("click", ()=>{ rows.forEach(saveOne); saveData(DATA); toast("Saved to Notes tab → AI notes & tricks"); render(); });
     }catch(e){ aiShowError(out, e); }
   });
 }
