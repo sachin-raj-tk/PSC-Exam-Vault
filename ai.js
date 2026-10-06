@@ -6,7 +6,7 @@
 const AI_STORE_KEY = "psev_ai_v1";
 const AI_TEMPLATES = [
   { key:"openrouter", label:"OpenRouter (many models, some free)", format:"openai", baseUrl:"https://openrouter.ai/api/v1", model:"", hint:"Pick any model id from openrouter.ai/models (free ones end in :free)." },
-  { key:"gemini", label:"Google Gemini", format:"openai", baseUrl:"https://generativelanguage.googleapis.com/v1beta/openai", model:"gemini-2.5-flash", hint:"Key from aistudio.google.com. Model names change — edit if needed." },
+  { key:"gemini", label:"Google Gemini", format:"openai", baseUrl:"https://generativelanguage.googleapis.com/v1beta/openai", model:"gemini-flash-latest", hint:"Key from aistudio.google.com. If you get a 404, enter a current model name (e.g. gemini-3.8-flash)." },
   { key:"groq", label:"Groq", format:"openai", baseUrl:"https://api.groq.com/openai/v1", model:"llama-3.3-70b-versatile", hint:"Key from console.groq.com. Check their model list for current names." },
   { key:"openai", label:"OpenAI", format:"openai", baseUrl:"https://api.openai.com/v1", model:"gpt-4o-mini", hint:"Key from platform.openai.com." },
   { key:"anthropic", label:"Anthropic (Claude)", format:"anthropic", baseUrl:"https://api.anthropic.com", model:"claude-haiku-4-5-20251001", hint:"Key from console.anthropic.com." },
@@ -64,7 +64,8 @@ async function aiRequest(preset, system, user, maxTokens){
     const msg = (data && (data.error && (data.error.message||data.error) || data.message)) || raw.slice(0,200) || ("HTTP "+res.status);
     const m = typeof msg==="string" ? msg : JSON.stringify(msg);
     const limit = res.status===429 || res.status===402 || res.status===529 || /quota|rate.?limit|exhaust|billing|credit|overload/i.test(m);
-    throw Object.assign(new Error(m.slice(0,240)), {status:res.status, limit});
+    const busy = !limit && (res.status===500 || res.status===502 || res.status===503 || res.status===504 || /high demand|unavailable|try again later|temporar/i.test(m));
+    throw Object.assign(new Error(m.slice(0,240)), {status:res.status, limit, busy});
   }
   let text = "";
   if(preset.format==="anthropic") text = ((data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n"));
@@ -97,7 +98,13 @@ async function aiAsk(system, user, maxTokens){
   const errors = [];
   for(const p of order){
     try{
-      const text = await aiRequest(p, system, user, maxTokens);
+      let text;
+      try{ text = await aiRequest(p, system, user, maxTokens); }
+      catch(e1){
+        /* provider briefly overloaded (503 etc.): wait a few seconds and retry once before moving on */
+        if(e1 && e1.busy){ await new Promise(r=>setTimeout(r,3500)); text = await aiRequest(p, system, user, maxTokens); }
+        else throw e1;
+      }
       st = aiLoad();
       const live = st.presets.find(x=>x.id===p.id);
       if(live){ live.uses = (live.uses||0)+1; live.lastUsedAt = Date.now(); delete live.limitHitAt; }
