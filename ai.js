@@ -48,6 +48,7 @@ async function aiRequest(preset, system, user, maxTokens){
     url = base + "/chat/completions";
     headers = { "content-type":"application/json", "authorization":"Bearer "+preset.apiKey };
     body = { model:preset.model, max_tokens:maxTokens||2500, temperature:0.4, messages:[{role:"system",content:system},{role:"user",content:user}] };
+    if(/openrouter\.ai/i.test(base)) body.reasoning = { exclude:true };
   }
   let res;
   try{
@@ -69,7 +70,16 @@ async function aiRequest(preset, system, user, maxTokens){
   if(preset.format==="anthropic") text = ((data.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n"));
   else text = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
   if(Array.isArray(text)) text = text.map(t=>t.text||"").join("\n");
-  if(!String(text).trim()) throw Object.assign(new Error("Empty reply from model"), {status:0});
+  if(!String(text).trim()){
+    /* reasoning models can spend the whole token budget on thinking and return nothing: retry once with a bigger budget */
+    if(!aiRequest._retry && (maxTokens||2500) < 6000){
+      aiRequest._retry = true;
+      try{ return await aiRequest(preset, system, user, Math.min(8000, Math.max(1500, (maxTokens||2500)*4))); }
+      finally{ aiRequest._retry = false; }
+    }
+    const fr = data && data.choices && data.choices[0] && data.choices[0].finish_reason;
+    throw Object.assign(new Error("Empty reply from model" + (fr ? " (finish: "+fr+")" : "") + " — it may be a reasoning model; try another model"), {status:0});
+  }
   return String(text).trim();
 }
 
@@ -245,7 +255,7 @@ function openAIPresetForm(id){
   document.getElementById("aiTestBtn").addEventListener("click", async ()=>{
     const out = document.getElementById("aiTestOut"); aiShowLoading(out,"Testing…");
     try{
-      const r = await aiRequest(Object.assign({}, p, read()), "You are a connection tester.", "Reply with the single word OK.", 20);
+      const r = await aiRequest(Object.assign({}, p, read()), "You are a connection tester.", "Reply with the single word OK.", 300);
       out.innerHTML = `<div class="status ok">✅ Works — model replied: ${escapeHtml(r.slice(0,60))}</div>`;
     }catch(e){ out.innerHTML = `<div class="status err" style="white-space:pre-wrap;">❌ ${escapeHtml(e.message)}${e.status?` (HTTP ${e.status})`:""}</div>`; }
   });
