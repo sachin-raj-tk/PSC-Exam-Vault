@@ -15,6 +15,8 @@ function loadData(){
   if(!Array.isArray(parsed.attempts)) parsed.attempts = [];
   if(!Array.isArray(parsed.banks)) parsed.banks = [];
   if(!Array.isArray(parsed.paperTemplates)) parsed.paperTemplates = [];
+  if(!Array.isArray(parsed.topicLists)) parsed.topicLists = [];
+  if(!parsed.topicLabels || typeof parsed.topicLabels !== "object") parsed.topicLabels = {};
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
   migrateStudyProgress(parsed.studyProgress);
   if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};
@@ -132,6 +134,11 @@ function countTopicAttempts(subject, topic){
   const cur = getCurrentSyllabusId();
   return (DATA.attempts||[]).filter(a=> a.type==="topic" && a.scopeKey===key && a.syllabus_id===cur).length;
 }
+function countTopicAttempts(subject, topic){
+  const key = `${subject}|||${topic}`;
+  const cur = getCurrentSyllabusId();
+  return (DATA.attempts||[]).filter(a=> a.type==="topic" && a.scopeKey===key && a.syllabus_id===cur).length;
+}
 
 /* ---- Daily activity streak ---- */
 function todayKey(){ return new Date().toISOString().slice(0,10); }
@@ -170,9 +177,21 @@ function saveTaxonomyState(obj){
 }
 let TAXONOMY_STATE = loadTaxonomyState();
 
-function getAllSubjects(){ return Object.keys(TAXONOMY_STATE); }
+function getAllSubjects(){
+  // Union of the curated taxonomy AND whatever subject strings actually
+  // exist on real questions (e.g. from a JSON import) — a subject can end
+  // up on a question without ever going through addCustomSubject, and it
+  // must still be selectable/findable everywhere, or renaming/reassigning
+  // can silently "lose" it.
+  const set = new Set(Object.keys(TAXONOMY_STATE));
+  allQuestions().forEach(q=>{ if(q.subject) set.add(q.subject); });
+  return Array.from(set);
+}
 function getTopicsForSubject(subject){
-  return TAXONOMY_STATE[subject] ? TAXONOMY_STATE[subject].slice() : [FALLBACK_TOPIC];
+  const set = new Set(TAXONOMY_STATE[subject] || [FALLBACK_TOPIC]);
+  allQuestions().forEach(q=>{ if(q.subject===subject && q.topic) set.add(q.topic); });
+  set.add(FALLBACK_TOPIC);
+  return Array.from(set);
 }
 function addCustomTopic(subject, topic){
   topic = topic.trim();
@@ -247,6 +266,113 @@ function setViewMode(v){ localStorage.setItem(VIEW_MODE_KEY, v); }
 function updateViewModeBtn(){
   const btn = document.getElementById("btnViewMode");
   if(btn) btn.textContent = getViewMode()==="scroll" ? "Scroll" : "Swipe";
+}
+
+/* ================= Difficulty marking ================= */
+const DIFFICULTY_ENABLED_KEY = "psev_difficulty_enabled";
+const DIFFICULTY_POINTS = { E:3, M:6, D:9 };
+const DIFFICULTY_LABELS = { E:"Easy", M:"Medium", D:"Difficult" };
+function isDifficultyMarkingEnabled(){ return localStorage.getItem(DIFFICULTY_ENABLED_KEY) !== "0"; }
+function setDifficultyMarkingEnabled(v){ localStorage.setItem(DIFFICULTY_ENABLED_KEY, v ? "1" : "0"); }
+function setDifficulty(paperId, qid, level){
+  const paper = DATA.papers.find(p=>p.id===paperId);
+  if(!paper) return null;
+  const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
+  if(!q) return null;
+  q.difficulty = (q.difficulty===level) ? undefined : level;
+  saveData(DATA);
+  return q.difficulty;
+}
+function diffSuffix(questions){
+  if(!isDifficultyMarkingEnabled()) return "";
+  const a = avgDifficulty(questions);
+  return a ? ` · avg diff ${a.avg}/9` : "";
+}
+function avgDifficulty(questions){
+  const marked = questions.filter(q=>q.difficulty && DIFFICULTY_POINTS[q.difficulty]);
+  if(marked.length===0) return null;
+  const sum = marked.reduce((s,q)=> s+DIFFICULTY_POINTS[q.difficulty], 0);
+  return { avg: Math.round((sum/marked.length)*10)/10, count: marked.length, total: questions.length };
+}
+
+/* ================= Notes ================= */
+function setNote(paperId, qid, text){
+  const paper = DATA.papers.find(p=>p.id===paperId);
+  if(!paper) return;
+  const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
+  if(!q) return;
+  q.note = text.trim();
+  saveData(DATA);
+}
+function collectNotedQuestions(){
+  return allQuestions().filter(q=>q.note && q.note.trim());
+}
+
+/* ================= Generic question-list sort (item 4: difficulty; item 3: time) ================= */
+const DIFFICULTY_ORDER = { E:1, M:2, D:3 };
+function sortQuestions(questions, sortMode, timeByKey){
+  if(!sortMode || sortMode==="none") return questions;
+  const arr = questions.slice();
+  const diffRank = q => q.difficulty ? DIFFICULTY_ORDER[q.difficulty] : 0;
+  const timeOf = q => (timeByKey && timeByKey[`${q._paperId}::${q.id}`]) || 0;
+  if(sortMode==="diff-asc") arr.sort((a,b)=> diffRank(a)-diffRank(b));
+  else if(sortMode==="diff-desc") arr.sort((a,b)=> diffRank(b)-diffRank(a));
+  else if(sortMode==="time-asc") arr.sort((a,b)=> timeOf(a)-timeOf(b));
+  else if(sortMode==="time-desc") arr.sort((a,b)=> timeOf(b)-timeOf(a));
+  return arr;
+}
+function sortControlHtml(currentSort, includeTime){
+  const opts = [
+    ["none","Original order"],
+    ["diff-asc","Difficulty: Easy → Hard"],
+    ["diff-desc","Difficulty: Hard → Easy"]
+  ];
+  if(includeTime){
+    opts.push(["time-desc","Time: Slowest first"], ["time-asc","Time: Fastest first"]);
+  }
+  return `<select id="qSortSelect" style="width:100%;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--ink-bg-raised);color:var(--text-on-ink);margin:8px 0;">
+    ${opts.map(([v,l])=>`<option value="${v}" ${currentSort===v?"selected":""}>${l}</option>`).join("")}
+  </select>`;
+}
+
+/* ================= Topic lists (priority collections) ================= */
+function findTopicList(id){ return (DATA.topicLists||[]).find(l=>l.id===id); }
+function addTopicToList(listId, subject, topic){
+  const list = findTopicList(listId);
+  if(!list) return;
+  if(!list.items.some(it=>it.subject===subject && it.topic===topic)){
+    list.items.push({ subject, topic });
+    saveData(DATA);
+  }
+}
+function removeTopicFromList(listId, subject, topic){
+  const list = findTopicList(listId);
+  if(!list) return;
+  list.items = list.items.filter(it=> !(it.subject===subject && it.topic===topic));
+  saveData(DATA);
+}
+
+/* ================= Topic labels (color-coded) ================= */
+const TOPIC_LABEL_PALETTE = [
+  { name:"Red", color:"#b14b4b" }, { name:"Gold", color:"#c9932b" },
+  { name:"Green", color:"#3e7a4f" }, { name:"Blue", color:"#3f5c8a" },
+  { name:"Purple", color:"#7a4a9e" }, { name:"Teal", color:"#2f6f5e" }
+];
+function topicLabelKey(subject, topic){ return `${subject}|||${topic}`; }
+function getTopicLabel(subject, topic){
+  return (DATA.topicLabels||{})[topicLabelKey(subject,topic)] || null;
+}
+function setTopicLabel(subject, topic, label){
+  if(!DATA.topicLabels) DATA.topicLabels = {};
+  const key = topicLabelKey(subject,topic);
+  if(!label){ delete DATA.topicLabels[key]; }
+  else{ DATA.topicLabels[key] = label; }
+  saveData(DATA);
+}
+function labelPillHtml(subject, topic){
+  const lbl = getTopicLabel(subject, topic);
+  if(!lbl) return "";
+  return `<span class="pill" style="background:${lbl.color}33;color:${lbl.color};border-color:${lbl.color};">${escapeHtml(lbl.name)}</span>`;
 }
 
 /* ================= Navigation (stack based) ================= */
@@ -395,6 +521,7 @@ document.getElementById("btnViewMode").addEventListener("click", ()=>{
 });
 document.getElementById("syllabusBtn").addEventListener("click", openSyllabusModal);
 document.getElementById("btnSearch").addEventListener("click", openGlobalSearchModal);
+document.getElementById("btnSearch").addEventListener("click", openGlobalSearchModal);
 
 function render(){
   if(timerIntervalId){ clearInterval(timerIntervalId); timerIntervalId = null; }
@@ -411,7 +538,11 @@ function render(){
     case "attempts": renderAttemptsRoot(); break;
     case "stats": renderStatsScreen(); break;
     case "stats-subject": renderStatsSubject(screen.subject); break;
+    case "stats-all-topics": renderStatsAllTopics(); break;
     case "flagged-list": renderFlaggedList(); break;
+    case "notes": renderNotesRoot(); break;
+    case "topic-lists": renderTopicListsRoot(); break;
+    case "topic-list-detail": renderTopicListDetail(screen.listId); break;
     case "paper-detail": renderPaperDetail(screen.paperId); break;
     case "subject-topics": renderSubjectTopicsList(screen.subject); break;
     case "subject-all": renderSubjectAllQuestions(screen.subject); break;
@@ -425,7 +556,7 @@ function render(){
   updateTopbarVisibility();
   typesetMath(mainEl);
 }
-const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","practice","attempt-review"]);
+const QUESTION_LIST_SCREENS = new Set(["paper-detail","subject-all","topic-detail","bank-detail","practice","attempt-review","flagged-list"]);
 function updateTopbarVisibility(){
   const screen = currentScreen();
   const isRoot = navStack.length===1;
@@ -492,7 +623,7 @@ function renderPapersList(){
       html += rowHtml({
         num: String(idx+1).padStart(2,"0"),
         title: p.name,
-        sub: p.post_name ? p.post_name : p.id,
+        sub: (p.post_name ? p.post_name : p.id) + diffSuffix(p.questions||[]),
         count: `${count} q`,
         dataAttr: `data-paper-id="${escapeHtml(p.id)}"`
       });
@@ -524,7 +655,7 @@ function renderSubjectsList(){
       html += rowHtml({
         num: String(idx+1).padStart(2,"0"),
         title: s,
-        sub: `${Math.max(getTopicsForSubject(s).length - 1, 0)} topics defined`,
+        sub: `${Math.max(getTopicsForSubject(s).length - 1, 0)} topics defined` + diffSuffix(visibleQuestions().filter(q=>q.subject===s)),
         count: `${counts[s]} q`,
         dataAttr: `data-subject="${escapeHtml(s)}"`
       });
@@ -539,7 +670,9 @@ function renderSubjectsList(){
 
 /* ================= Topics list (global within syllabus, sorted by frequency) ================= */
 function renderTopicsList(){
+  const screen = currentScreen();
   const searchTerm = getSearch();
+  const topicListSort = screen.topicListSort || "freq";
   const qs = visibleQuestions();
   const counts = {};
   qs.forEach(q=>{
@@ -548,15 +681,29 @@ function renderTopicsList(){
   });
   let entries = Object.entries(counts).map(([key,count])=>{
     const [subject, topic] = key.split("|||");
-    return { subject, topic, count };
+    const lbl = getTopicLabel(subject, topic);
+    return { subject, topic, count, label: lbl ? lbl.name : null };
   });
-  entries.sort((a,b)=> b.count - a.count || a.topic.localeCompare(b.topic));
+  if(topicListSort==="label") entries.sort((a,b)=> (a.label||"zzz").localeCompare(b.label||"zzz") || a.topic.localeCompare(b.topic));
+  else if(topicListSort==="az") entries.sort((a,b)=> a.topic.localeCompare(b.topic));
+  else entries.sort((a,b)=> b.count - a.count || a.topic.localeCompare(b.topic));
+
+  let html = `<div style="display:flex;gap:8px;margin-bottom:10px;">
+    <button class="iconbtn" id="myListsBtn" style="flex:1;justify-content:center;">📌 My topic lists</button>
+  </div>`;
 
   if(entries.length===0){
-    mainEl.innerHTML = emptyState("No topics yet", "Import a question paper into this syllabus to see topics here, ranked by how often they occur.");
+    html += emptyState("No topics yet", "Import a question paper into this syllabus to see topics here, ranked by how often they occur.");
+    mainEl.innerHTML = html;
+    document.getElementById("myListsBtn").addEventListener("click", ()=> pushScreen({ type:"topic-lists" }));
     return;
   }
-  let html = `<input class="search" id="searchBox" placeholder="Search topics…" value="${escapeHtml(searchTerm)}">`;
+  html += `<input class="search" id="searchBox" placeholder="Search topics…" value="${escapeHtml(searchTerm)}">`;
+  html += `<div class="segmented" id="topicSortSeg">
+    <button data-s="freq" class="${topicListSort==='freq'?'active':''}">Frequency</button>
+    <button data-s="az" class="${topicListSort==='az'?'active':''}">A–Z</button>
+    <button data-s="label" class="${topicListSort==='label'?'active':''}">By label</button>
+  </div>`;
   html += `<div id="listWrap">`;
   entries
     .filter(e=>e.topic.toLowerCase().includes(searchTerm.toLowerCase()) || e.subject.toLowerCase().includes(searchTerm.toLowerCase()))
@@ -566,16 +713,21 @@ function renderTopicsList(){
       const bits = [e.subject];
       if(studied) bits.push(`📖 ${studied}×`);
       if(attempts) bits.push(`📝 ${attempts} test${attempts===1?"":"s"}`);
+      const dsx = diffSuffix(visibleQuestions().filter(q=>q.subject===e.subject && (q.topic||FALLBACK_TOPIC)===e.topic)); if(dsx) bits.push(dsx.replace(' · ',''));
       html += rowHtml({
         num: String(idx+1).padStart(2,"0"),
         title: e.topic,
         sub: bits.join(" · "),
         count: `${e.count} q`,
         dataAttr: `data-subject="${escapeHtml(e.subject)}" data-topic="${escapeHtml(e.topic)}"`
-      });
+      }).replace('<div class="count">', `${labelPillHtml(e.subject,e.topic)}<div class="count">`);
     });
   html += `</div>`;
   mainEl.innerHTML = html;
+  document.getElementById("myListsBtn").addEventListener("click", ()=> pushScreen({ type:"topic-lists" }));
+  document.querySelectorAll("#topicSortSeg button").forEach(btn=>{
+    btn.addEventListener("click", ()=>{ screen.topicListSort = btn.dataset.s; render(); });
+  });
   document.querySelectorAll("#listWrap .row").forEach(row=>{
     row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: row.dataset.subject, topic: row.dataset.topic }));
   });
@@ -635,7 +787,7 @@ function renderSubjectTopicsList(subject){
         html += rowHtml({
           num: String(idx+1).padStart(2,"0"),
           title: e.topic,
-          sub: bits.length ? bits.join(" · ") : subject,
+          sub: (bits.length ? bits.join(" · ") : subject) + diffSuffix(visibleQuestions().filter(q=>q.subject===subject && (q.topic||FALLBACK_TOPIC)===e.topic)),
           count: `${e.count} q`,
           dataAttr: `data-topic="${escapeHtml(e.topic)}"`
         });
@@ -723,12 +875,16 @@ function renderQuestionListScreen({ backLabel, onBack, title, meta, questions, a
   const showExplanations = !!screen.showExplanations;
   const locked = screen.answersLocked !== false; // default true (locked)
   const hasExplanations = questions.some(q=> q.explanation && q.explanation.trim());
+  const qSort = screen.qSort || "none";
+
+  const diffStat = avgDifficulty(questions);
+  const fullMeta = meta + (diffStat ? ` · avg difficulty ${diffStat.avg}/9 (${diffStat.count}/${diffStat.total} marked)` : "");
 
   let html = `<div class="detail-head">
     <div style="width:100%">
       <div class="backrow" id="backBtn">‹ ${escapeHtml(backLabel)}</div>
       <h2>${escapeHtml(title)}</h2>
-      <div class="meta">${escapeHtml(meta)}</div>
+      <div class="meta">${escapeHtml(fullMeta)}</div>
     </div>
   </div>`;
 
@@ -745,11 +901,13 @@ function renderQuestionListScreen({ backLabel, onBack, title, meta, questions, a
     ${hasExplanations ? `<button class="iconbtn" id="toggleExplBtn" style="flex:1;justify-content:center;">${showExplanations?"Hide explanations":"Show explanations"}</button>` : ""}
     <button class="iconbtn ${locked?"":"good"}" id="toggleLockBtn" style="flex:1;justify-content:center;">${locked?"🔒 Answers locked":"🔓 Answers unlocked"}</button>
   </div>`;
+  if(questions.length>1) html += sortControlHtml(qSort, false);
 
-  if(questions.length===0){
+  const sortedQuestions = sortQuestions(questions, qSort);
+  if(sortedQuestions.length===0){
     html += emptyState("No questions here", "");
   } else {
-    html += renderQuestionsListHtml(questions, screen, (q, idx)=> questionSlipHtml(q, idx, hideAnswers, showExplanations, locked));
+    html += renderQuestionsListHtml(sortedQuestions, screen, (q, idx)=> questionSlipHtml(q, idx, hideAnswers, showExplanations, locked));
   }
 
   mainEl.innerHTML = html;
@@ -758,14 +916,16 @@ function renderQuestionListScreen({ backLabel, onBack, title, meta, questions, a
   document.getElementById("toggleLockBtn").addEventListener("click", ()=>{ screen.answersLocked = !locked; render(); });
   const explBtn = document.getElementById("toggleExplBtn");
   if(explBtn) explBtn.addEventListener("click", ()=>{ screen.showExplanations = !showExplanations; render(); });
+  const sortSel = document.getElementById("qSortSelect");
+  if(sortSel) sortSel.addEventListener("change", ()=>{ screen.qSort = sortSel.value; render(); });
   const practiceBtn = document.getElementById("startPracticeBtn");
   if(practiceBtn){
     practiceBtn.addEventListener("click", ()=> openStartTestModal(practiceInfo.sourceType, practiceInfo.scopeKey, practiceInfo.scopeLabel, questions, practiceInfo.syllabusId||getCurrentSyllabusId()));
   }
   if(bindActions) bindActions();
-  if(questions.length>0){
-    bindSlipInteractions(questions);
-    bindSwipeNav(questions, screen);
+  if(sortedQuestions.length>0){
+    bindSlipInteractions(sortedQuestions);
+    bindSwipeNav(sortedQuestions, screen);
   }
 }
 
@@ -773,10 +933,15 @@ function renderQuestionListScreen({ backLabel, onBack, title, meta, questions, a
 function renderPaperDetail(paperId){
   const paper = DATA.papers.find(p=>p.id===paperId);
   if(!paper){ popScreen(); return; }
-  const questions = (paper.questions||[]).map(q=>Object.assign({}, q, {
+  const screen = currentScreen();
+  const allQs = (paper.questions||[]).map(q=>Object.assign({}, q, {
     _paperId: paper.id, _paperName: paper.name, _postName: paper.post_name||""
   }));
+  const fSubject = screen.paperFilterSubject || null;
+  const fTopic = screen.paperFilterTopic || null;
+  const questions = allQs.filter(q=> (!fSubject || q.subject===fSubject) && (!fTopic || (q.topic||FALLBACK_TOPIC)===fTopic));
   const syllabusName = getSyllabusById(paper.syllabus_id||"default").name;
+  const filterLabel = fTopic ? `Filtered: ${fSubject} — ${fTopic}` : fSubject ? `Filtered: ${fSubject}` : "Filter by subject/topic";
 
   const actionsHtml = `
     <div style="display:flex;gap:8px;margin:12px 0 4px;">
@@ -790,6 +955,10 @@ function renderPaperDetail(paperId){
     <div style="display:flex;gap:8px;margin:0 0 4px;">
       <button class="iconbtn" id="moveSyllabusBtn" style="flex:1;justify-content:center;">Syllabus: ${escapeHtml(syllabusName)}</button>
     </div>
+    <div style="display:flex;gap:8px;margin:0 0 4px;">
+      <button class="iconbtn ${(fSubject||fTopic)?"primary":""}" id="paperSubjTopicFilterBtn" style="flex:1;justify-content:center;">${escapeHtml(filterLabel)}</button>
+      ${(fSubject||fTopic) ? `<button class="iconbtn" id="clearPaperFilterBtn">Clear</button>` : ""}
+    </div>
     <div style="display:flex;justify-content:flex-end;margin:4px 0 4px;">
       <button class="iconbtn" id="deletePaperBtn" style="border-color:var(--maroon);color:#f0a3ab;font-size:0.76rem;padding:5px 12px;">🗑 Delete paper</button>
     </div>`;
@@ -798,7 +967,7 @@ function renderPaperDetail(paperId){
     backLabel: "Back to Papers",
     onBack: popScreen,
     title: paper.name,
-    meta: `${questions.length} question${questions.length===1?"":"s"} · Paper ID: ${paper.id}${paper.post_name ? " · "+paper.post_name : ""}`,
+    meta: `${questions.length} of ${allQs.length} question${allQs.length===1?"":"s"} · Paper ID: ${paper.id}${paper.post_name ? " · "+paper.post_name : ""}`,
     questions,
     actionsHtml,
     allowPractice: true,
@@ -809,6 +978,9 @@ function renderPaperDetail(paperId){
       document.getElementById("addAnswerKeyBtn").addEventListener("click", ()=> openAddAnswerKeyModal(paper.id));
       document.getElementById("addExplanationsBtn").addEventListener("click", ()=> openAddExplanationsModal(paper.id));
       document.getElementById("moveSyllabusBtn").addEventListener("click", ()=> openMoveSyllabusModal(paper.id));
+      document.getElementById("paperSubjTopicFilterBtn").addEventListener("click", ()=> openPaperSubjectTopicFilterModal(allQs, screen));
+      const clearBtn = document.getElementById("clearPaperFilterBtn");
+      if(clearBtn) clearBtn.addEventListener("click", ()=>{ screen.paperFilterSubject=null; screen.paperFilterTopic=null; render(); });
       document.getElementById("deletePaperBtn").addEventListener("click", ()=>{
         if(confirm(`Delete "${paper.name}" and all its questions? This can't be undone.`)){
           DATA.papers = DATA.papers.filter(p=>p.id!==paper.id);
@@ -819,6 +991,55 @@ function renderPaperDetail(paperId){
       });
     }
   });
+}
+
+function openPaperSubjectTopicFilterModal(allQs, screen){
+  const subjects = Array.from(new Set(allQs.map(q=>q.subject))).sort((a,b)=>a.localeCompare(b));
+  let chosenSubject = screen.paperFilterSubject || null;
+
+  function topicsForChosen(){
+    if(!chosenSubject) return [];
+    return Array.from(new Set(allQs.filter(q=>q.subject===chosenSubject).map(q=>q.topic||FALLBACK_TOPIC))).sort((a,b)=>a.localeCompare(b));
+  }
+
+  function draw(){
+    const topics = topicsForChosen();
+    modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="backdrop">
+      <div class="modal">
+        <h3>Filter this paper</h3>
+        <div class="field">
+          <label>Subject</label>
+          <select id="pfSubject">
+            <option value="">All subjects</option>
+            ${subjects.map(s=>`<option value="${escapeHtml(s)}" ${chosenSubject===s?"selected":""}>${escapeHtml(s)}</option>`).join("")}
+          </select>
+        </div>
+        ${chosenSubject ? `<div class="field">
+          <label>Topic</label>
+          <select id="pfTopic">
+            <option value="">All topics in ${escapeHtml(chosenSubject)}</option>
+            ${topics.map(t=>`<option value="${escapeHtml(t)}" ${screen.paperFilterTopic===t?"selected":""}>${escapeHtml(t)}</option>`).join("")}
+          </select>
+        </div>` : ""}
+        <div class="row-btns">
+          <button class="iconbtn" id="cancelPf" style="flex:1;justify-content:center;">Cancel</button>
+          <button class="iconbtn primary" id="applyPf" style="flex:1;justify-content:center;">Apply</button>
+        </div>
+      </div>
+    </div>`;
+    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+    document.getElementById("cancelPf").addEventListener("click", closeModal);
+    document.getElementById("pfSubject").addEventListener("change", (e)=>{ chosenSubject = e.target.value || null; draw(); });
+    document.getElementById("applyPf").addEventListener("click", ()=>{
+      screen.paperFilterSubject = chosenSubject;
+      const topicSel = document.getElementById("pfTopic");
+      screen.paperFilterTopic = (chosenSubject && topicSel && topicSel.value) ? topicSel.value : null;
+      closeModal();
+      render();
+    });
+  }
+  draw();
 }
 
 /* ================= Subject → all questions (flat) ================= */
@@ -886,6 +1107,7 @@ function renderTopicDetail(subject, topic){
 
   const studyCount = getStudyCount(subject, topic);
   const attemptCount = countTopicAttempts(subject, topic);
+  const currentLabel = getTopicLabel(subject, topic);
   const actionsHtml = `<div class="stepper left" id="studyStepper">
     <span class="study-label">📖 Studied</span>
     <button id="studyMinus" ${studyCount<=0?"disabled":""}>−1</button>
@@ -901,6 +1123,7 @@ function renderTopicDetail(subject, topic){
   </div>
   <div style="display:flex;gap:8px;margin:0 0 4px;">
     <button class="iconbtn" id="filterPapersBtn" style="flex:1;justify-content:center;">${filterLabel}</button>
+    <button class="iconbtn" id="labelTopicBtn" style="flex:1;justify-content:center;">${currentLabel ? `🏷️ ${escapeHtml(currentLabel.name)}` : "🏷️ Add label"}</button>
   </div>`;
 
   renderQuestionListScreen({
@@ -921,6 +1144,7 @@ function renderTopicDetail(subject, topic){
       }
       document.getElementById("renameTopicBtn").addEventListener("click", ()=> openRenameTopicModal(subject, topic));
       document.getElementById("copyListBtn").addEventListener("click", ()=> copyQuestionsToClipboard(questions, `${subject} — ${topic}`));
+      document.getElementById("labelTopicBtn").addEventListener("click", ()=> openTopicLabelModal(subject, topic));
       document.getElementById("filterPapersBtn").addEventListener("click", ()=>{
         openPaperFilterModal(included, papersList, `topic:${subject}|||${topic}`, (newSelected)=>{
           screen.includedPapers = (newSelected.length===papersList.length) ? undefined : newSelected;
@@ -936,6 +1160,8 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
   const isDeleted = Number(q.correct_answer_index) === DELETED_SENTINEL;
   const originalNum = questionOriginalNumber(q);
   const flagged = !!q.flagged;
+  const hasNote = !!(q.note && q.note.trim());
+  const diffEnabled = isDifficultyMarkingEnabled();
 
   const opts = (q.options||[]).map((opt, i)=>{
     const isCorrect = !isDeleted && q.correct_answer_index !== null && q.correct_answer_index !== undefined && Number(q.correct_answer_index) === i;
@@ -957,6 +1183,11 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
     expl = `<div class="explanation-block"><div class="exp-label">Explanation</div>${renderRichText(q.explanation)}</div>`;
   }
 
+  const diffRow = diffEnabled ? `<div class="diff-row">
+    <span class="diff-label">Difficulty:</span>
+    ${["E","M","D"].map(lv=>`<button type="button" class="diff-btn diff-${lv} ${q.difficulty===lv?"active":""}" data-action="set-difficulty" data-level="${lv}">${lv}</button>`).join("")}
+  </div>` : "";
+
   return `<div class="slip ${isDeleted?"slip-deleted":""}" data-qid="${escapeHtml(q._paperId)}::${escapeHtml(q.id)}">
     <div class="slip-head">
       <div class="qno">Q${idx}${originalNum?` <span class="qno-orig">(Paper Q${escapeHtml(originalNum)})</span>`:""}</div>
@@ -965,11 +1196,13 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
         <span class="pill paper">${escapeHtml(q._paperName)}</span>
         <span class="pill subject" data-action="edit-subject">${escapeHtml(q.subject||"Unclassified")} ✎</span>
         <span class="pill topic" data-action="edit-topic">${escapeHtml(q.topic||FALLBACK_TOPIC)} ✎</span>
+        ${labelPillHtml(q.subject, q.topic||FALLBACK_TOPIC)}
       </div>
     </div>
     <div class="actions-row">
       <div class="grp">
         <button class="actbtn ${flagged?"flagged":""}" data-action="toggle-flag" title="Flag for review">${flagged?"⭐":"☆"}</button>
+        <button class="actbtn ${hasNote?"has-note":""}" data-action="edit-note" title="Notes">${hasNote?"🗒️":"📄"}</button>
         <button class="actbtn" data-action="copy-question" title="Copy this question">📋</button>
         <button class="actbtn" data-action="edit-question" title="Edit question">📝</button>
       </div>
@@ -978,10 +1211,12 @@ function questionSlipHtml(q, idx, hideAnswers, showExplanations, locked){
         <button class="actbtn danger" data-action="delete-question" title="Delete question">🗑</button>
       </div>
     </div>
+    ${diffRow}
     ${isDeleted ? `<div class="deleted-banner">Deleted question (per official PSC answer key)</div>` : ""}
     <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options">${opts}</ul>
     ${expl}
+    ${hasNote ? `<div class="note-preview">🗒️ ${escapeHtml(q.note.slice(0,140))}${q.note.length>140?"…":""}</div>` : ""}
     ${hint ? `<div class="opthint">${hint}</div>` : ""}
   </div>`;
 }
@@ -1013,6 +1248,33 @@ function bindSlipInteractions(questions){
         render();
         toast("Question deleted");
       }
+    });
+  });
+  document.querySelectorAll('.actbtn[data-action="toggle-flag"]').forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const slip = e.target.closest(".slip");
+      const [paperId, qid] = slip.dataset.qid.split("::");
+      const nowFlagged = toggleFlag(paperId, qid);
+      render();
+      toast(nowFlagged ? "Flagged for review" : "Flag removed");
+    });
+  });
+  document.querySelectorAll('.diff-btn[data-action="set-difficulty"]').forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const slip = e.target.closest(".slip");
+      const [paperId, qid] = slip.dataset.qid.split("::");
+      setDifficulty(paperId, qid, btn.dataset.level);
+      render();
+    });
+  });
+  document.querySelectorAll('.actbtn[data-action="edit-note"]').forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const slip = e.target.closest(".slip");
+      const [paperId, qid] = slip.dataset.qid.split("::");
+      openNoteModal(paperId, qid);
     });
   });
   document.querySelectorAll('.actbtn[data-action="toggle-flag"]').forEach(btn=>{
@@ -1110,6 +1372,50 @@ function toggleFlag(paperId, qid){
 function collectFlaggedQuestions(){
   return visibleQuestions().filter(q=>q.flagged);
 }
+function toggleFlag(paperId, qid){
+  const paper = DATA.papers.find(p=>p.id===paperId);
+  if(!paper) return false;
+  const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
+  if(!q) return false;
+  q.flagged = !q.flagged;
+  saveData(DATA);
+  return q.flagged;
+}
+function collectFlaggedQuestions(){
+  return visibleQuestions().filter(q=>q.flagged);
+}
+
+/* ================= Note modal ================= */
+function openNoteModal(paperId, qid){
+  const paper = DATA.papers.find(p=>p.id===paperId);
+  if(!paper) return;
+  const q = (paper.questions||[]).find(qq=>String(qq.id)===qid);
+  if(!q) return;
+  modalRoot.innerHTML = `
+  <div class="modal-backdrop" id="backdrop">
+    <div class="modal">
+      <h3>My notes</h3>
+      <div class="meta" style="margin-bottom:8px;">${escapeHtml(q._paperName || paper.name)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div>
+      <div class="field">
+        <textarea id="noteText" class="prose" placeholder="Your thoughts, mnemonics, why you got it wrong…" style="min-height:140px;">${escapeHtml(q.note||"")}</textarea>
+      </div>
+      <div class="row-btns">
+        <button class="iconbtn" id="cancelNote" style="flex:1;justify-content:center;">Cancel</button>
+        <button class="iconbtn primary" id="saveNote" style="flex:1;justify-content:center;">Save</button>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("cancelNote").addEventListener("click", closeModal);
+  const ta = document.getElementById("noteText");
+  ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  document.getElementById("saveNote").addEventListener("click", ()=>{
+    setNote(paperId, qid, ta.value);
+    closeModal();
+    render();
+    toast("Note saved");
+  });
+}
 
 /* ================= Edit question modal ================= */
 function openEditQuestionModal(paperId, qid){
@@ -1198,7 +1504,7 @@ function openPaperFilterModal(currentIncluded, papersInScope, scopeTag, onApply)
         <button class="iconbtn" id="selectAllBtn" style="flex:1;justify-content:center;">Select all</button>
         <button class="iconbtn" id="selectNoneBtn" style="flex:1;justify-content:center;">Select none</button>
       </div>
-      <div id="paperCheckList">${listHtml()}</div>
+      <div id="paperCheckList" style="max-height:36vh;overflow-y:auto;">${listHtml()}</div>
       <div class="divider">— saved templates —</div>
       <div id="templateList">${templatesHtml()}</div>
       <div class="field" style="display:flex;gap:8px;align-items:flex-end;margin-top:10px;">
@@ -1499,8 +1805,9 @@ function openStartTestModal(sourceType, scopeKey, scopeLabel, questions, syllabu
   draw();
 }
 
-function practiceSlipHtml(q, idx, selectedIndex){
+function practiceSlipHtml(q, idx, selectedIndex, guessed){
   const originalNum = questionOriginalNumber(q);
+  const diffEnabled = isDifficultyMarkingEnabled();
   const opts = (q.options||[]).map((opt,i)=>{
     const isSelected = selectedIndex!==null && selectedIndex!==undefined && Number(selectedIndex)===i;
     return `<li class="${isSelected?"selected":""}" data-idx="${i}">
@@ -1508,6 +1815,10 @@ function practiceSlipHtml(q, idx, selectedIndex){
       <span class="opttext">${renderRichText(opt)}</span>
     </li>`;
   }).join("");
+  const diffRow = diffEnabled ? `<div class="diff-row">
+    <span class="diff-label">Difficulty:</span>
+    ${["E","M","D"].map(lv=>`<button type="button" class="diff-btn diff-${lv} ${q.difficulty===lv?"active":""}" data-action="set-difficulty" data-level="${lv}">${lv}</button>`).join("")}
+  </div>` : "";
   return `<div class="slip" data-qid="${escapeHtml(q._paperId)}::${escapeHtml(q.id)}">
     <div class="slip-head">
       <div class="qno">Q${idx}${originalNum?` <span class="qno-orig">(Paper Q${escapeHtml(originalNum)})</span>`:""}</div>
@@ -1518,8 +1829,10 @@ function practiceSlipHtml(q, idx, selectedIndex){
         <span class="pill topic">${escapeHtml(q.topic||FALLBACK_TOPIC)}</span>
       </div>
     </div>
+    ${diffRow}
     <div class="qtext">${renderRichText(q.question_text)}</div>
     <ul class="options practice">${opts}</ul>
+    <button type="button" class="guess-btn ${guessed?"active":""}" data-action="toggle-guess">🤔 ${guessed?"Marked as a guess — tap to unmark":"Mark as a guess"}</button>
   </div>`;
 }
 function bindPracticeInteractions(screen){
@@ -1533,9 +1846,29 @@ function bindPracticeInteractions(screen){
       render();
     });
   });
+  document.querySelectorAll('.diff-btn[data-action="set-difficulty"]').forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const slip = e.target.closest(".slip");
+      const [paperId, qid] = slip.dataset.qid.split("::");
+      setDifficulty(paperId, qid, btn.dataset.level);
+      render();
+    });
+  });
+  document.querySelectorAll('.guess-btn[data-action="toggle-guess"]').forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const slip = e.target.closest(".slip");
+      const key = slip.dataset.qid;
+      if(!screen.guesses) screen.guesses = {};
+      screen.guesses[key] = !screen.guesses[key];
+      if(!screen.guesses[key]) delete screen.guesses[key];
+      render();
+    });
+  });
 }
 
-function computeAttemptResults(questionRefs, answers){
+function computeAttemptResults(questionRefs, answers, guesses){
   const idx = buildQuestionIndex();
   let correctCount=0, wrongCount=0, unansweredCount=0;
   const answerRecords = [];
@@ -1554,7 +1887,8 @@ function computeAttemptResults(questionRefs, answers){
     }
     answerRecords.push({
       paperId: ref.paperId, qid: ref.qid, subject: q.subject, topic: q.topic||FALLBACK_TOPIC,
-      selectedIndex, correctIndex: isGraded?Number(correctIndex):null, isCorrect, isGraded
+      selectedIndex, correctIndex: isGraded?Number(correctIndex):null, isCorrect, isGraded,
+      guessed: !!(guesses && guesses[key]), difficulty: q.difficulty || null
     });
   });
   return { answerRecords, correctCount, wrongCount, unansweredCount, totalCount: answerRecords.length };
@@ -1565,7 +1899,7 @@ function submitPracticeTest(screen, autoSubmitted){
   const orderedQuestions = screen.questionRefs.map(ref=> idxMap[`${ref.paperId}::${ref.qid}`]).filter(Boolean);
   flushCurrentQuestionTime(screen, orderedQuestions);
 
-  const results = computeAttemptResults(screen.questionRefs, screen.answers);
+  const results = computeAttemptResults(screen.questionRefs, screen.answers, screen.guesses);
   if(screen.timeSpent){
     results.answerRecords.forEach(rec=>{
       const key = `${rec.paperId}::${rec.qid}`;
@@ -1694,7 +2028,7 @@ function renderPracticeScreen(screen){
       <button class="iconbtn primary" id="submitTestBtn">Submit</button>
     </div>`;
 
-    html += renderQuestionsListHtml(questions, screen, (q,i)=> practiceSlipHtml(q, i, screen.answers[`${q._paperId}::${q.id}`]), (q)=> screen.answers[`${q._paperId}::${q.id}`]!==undefined);
+    html += renderQuestionsListHtml(questions, screen, (q,i)=> practiceSlipHtml(q, i, screen.answers[`${q._paperId}::${q.id}`], screen.guesses && screen.guesses[`${q._paperId}::${q.id}`]), (q)=> screen.answers[`${q._paperId}::${q.id}`]!==undefined);
     mainEl.innerHTML = html;
     document.getElementById("backBtn").addEventListener("click", ()=>{
       if(answeredCount>0 && !confirm("Exit without submitting? Your answers won't be saved.")) return;
@@ -1764,6 +2098,9 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
   }
 
   const timeBadge = (rec.timeMs && rec.timeMs>0) ? `<span class="pill time-pill">⏱ ${formatDuration(rec.timeMs)}</span>` : "";
+  const guessBadge = rec.guessed ? `<span class="pill guess-pill">🤔 Guessed</span>` : "";
+  const diffVal = rec.difficulty || q.difficulty;
+  const diffBadge = diffVal ? `<span class="pill diff-pill diff-${diffVal}">${diffVal}</span>` : "";
 
   const slipClass = isGraded ? (rec.selectedIndex===null ? "" : (rec.isCorrect?"slip-correct":"slip-wrong")) : "";
 
@@ -1771,6 +2108,8 @@ function reviewSlipHtml(q, idx, rec, showExplanations){
     <div class="slip-head">
       <div class="qno">Q${idx}${originalNum?` <span class="qno-orig">(Paper Q${escapeHtml(originalNum)})</span>`:""}</div>
       <div class="pills">
+        ${diffBadge}
+        ${guessBadge}
         ${timeBadge}
         ${q._postName ? `<span class="pill post">${escapeHtml(q._postName)}</span>` : ""}
         <span class="pill paper">${escapeHtml(q._paperName)}</span>
@@ -1795,6 +2134,8 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
   const idxMap = buildQuestionIndex();
   const resolved = answerRecords.map(rec=>({ rec, q: idxMap[`${rec.paperId}::${rec.qid}`] })).filter(x=>x.q);
   const filter = screen.reviewFilter || "all";
+  const guessFilter = screen.guessFilter || "all";
+  const qSort = screen.qSort || "none";
 
   let html = `<div class="detail-head">
     <div style="width:100%">
@@ -1815,6 +2156,15 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
     html += `<div style="margin:-4px 0 10px;"><button class="iconbtn" id="clearFilterBtn">Showing "${filter}" only — tap to show all</button></div>`;
   }
 
+  const hasGuesses = resolved.some(x=>x.rec.guessed);
+  if(hasGuesses){
+    html += `<div class="segmented" id="guessSeg" style="margin-bottom:8px;">
+      <button data-g="all" class="${guessFilter==='all'?'active':''}">All</button>
+      <button data-g="guessed-right" class="${guessFilter==='guessed-right'?'active':''}">Guessed right</button>
+      <button data-g="guessed-wrong" class="${guessFilter==='guessed-wrong'?'active':''}">Guessed wrong</button>
+    </div>`;
+  }
+
   const hasTiming = resolved.some(x=> x.rec.timeMs && x.rec.timeMs>0);
   const hasExplanations = resolved.some(x=> x.q.explanation && x.q.explanation.trim());
   let actionsHtml = extraActionsHtml || "";
@@ -1823,22 +2173,28 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
       <button class="iconbtn" id="toggleExplBtn" style="flex:1;justify-content:center;">${screen.showExplanations?"Hide explanations":"Show explanations"}</button>
     </div>`;
   }
-  if(hasTiming){
-    actionsHtml += `<div class="meta" style="margin:4px 0 4px;">⏱ Time-per-question is shown on each card below (tracked in swipe view).</div>`;
-  }
   if(actionsHtml) html += actionsHtml;
+  html += sortControlHtml(qSort, hasTiming);
+  if(hasTiming){
+    html += `<div class="meta" style="margin:0 0 8px;">⏱ Time-per-question is shown on each card below (tracked in swipe view).</div>`;
+  }
 
   let filteredResolved = resolved;
-  if(filter==="correct") filteredResolved = resolved.filter(x=> x.rec.isGraded && x.rec.isCorrect);
-  else if(filter==="wrong") filteredResolved = resolved.filter(x=> x.rec.isGraded && !x.rec.isCorrect && x.rec.selectedIndex!==null);
-  else if(filter==="unanswered") filteredResolved = resolved.filter(x=> x.rec.isGraded && x.rec.selectedIndex===null);
+  if(filter==="correct") filteredResolved = filteredResolved.filter(x=> x.rec.isGraded && x.rec.isCorrect);
+  else if(filter==="wrong") filteredResolved = filteredResolved.filter(x=> x.rec.isGraded && !x.rec.isCorrect && x.rec.selectedIndex!==null);
+  else if(filter==="unanswered") filteredResolved = filteredResolved.filter(x=> x.rec.isGraded && x.rec.selectedIndex===null);
+  if(guessFilter==="guessed-right") filteredResolved = filteredResolved.filter(x=> x.rec.guessed && x.rec.isCorrect);
+  else if(guessFilter==="guessed-wrong") filteredResolved = filteredResolved.filter(x=> x.rec.guessed && x.rec.isGraded && !x.rec.isCorrect);
 
-  const questions = filteredResolved.map(x=>x.q);
+  const timeByKey = {};
+  filteredResolved.forEach(x=>{ if(x.rec.timeMs) timeByKey[`${x.q._paperId}::${x.q.id}`] = x.rec.timeMs; });
+  let questions = filteredResolved.map(x=>x.q);
+  questions = sortQuestions(questions, qSort, timeByKey);
   const recMap = {};
   filteredResolved.forEach(x=>{ recMap[`${x.q._paperId}::${x.q.id}`] = x.rec; });
 
   if(questions.length===0){
-    html += emptyState("No questions to show", filter!=="all" ? `No questions match "${filter}".` : "The questions in this attempt may have been deleted since.");
+    html += emptyState("No questions to show", (filter!=="all"||guessFilter!=="all") ? "No questions match these filters." : "The questions in this attempt may have been deleted since.");
   } else {
     html += renderQuestionsListHtml(questions, screen, (q,i)=> reviewSlipHtml(q, i, recMap[`${q._paperId}::${q.id}`], !!screen.showExplanations));
   }
@@ -1855,6 +2211,11 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
   });
   const clearBtn = document.getElementById("clearFilterBtn");
   if(clearBtn) clearBtn.addEventListener("click", ()=>{ screen.reviewFilter="all"; screen.qIndex=0; render(); });
+  document.querySelectorAll("#guessSeg button").forEach(btn=>{
+    btn.addEventListener("click", ()=>{ screen.guessFilter = btn.dataset.g; screen.qIndex=0; render(); });
+  });
+  const sortSel = document.getElementById("qSortSelect");
+  if(sortSel) sortSel.addEventListener("change", ()=>{ screen.qSort = sortSel.value; screen.qIndex=0; render(); });
   const explBtn = document.getElementById("toggleExplBtn");
   if(explBtn) explBtn.addEventListener("click", ()=>{ screen.showExplanations = !screen.showExplanations; render(); });
   if(bindExtra) bindExtra();
@@ -2442,10 +2803,50 @@ function bindStatsQuickActions(){
   if(mockBtn) mockBtn.addEventListener("click", openMockExamModal);
 }
 
-function renderStatsScreen(){
-  const screen = currentScreen();
+/* ================= Stats (sub-tabbed) ================= */
+const STATS_TABS = [
+  ["overview","Overview"],["subjects","Subjects"],["time","Time"],["difficulty","Difficulty"],["guess","Guesswork"]
+];
+function collectAttemptRecords(){
   const cur = getCurrentSyllabusId();
-  const attempts = (DATA.attempts||[]).filter(a=> a.type==="bank" || a.syllabus_id===cur);
+  const idx = buildQuestionIndex();
+  const out = [];
+  (DATA.attempts||[]).forEach(a=>{
+    if(a.type!=="bank" && a.syllabus_id!==cur) return;
+    (a.answers||[]).forEach(rec=>{
+      const q = idx[`${rec.paperId}::${rec.qid}`];
+      out.push(Object.assign({}, rec, { difficulty: rec.difficulty || (q && q.difficulty) || null }));
+    });
+  });
+  return out;
+}
+function aggregateBy(recs, keyFn){
+  const m = {};
+  recs.forEach(r=>{ const k = keyFn(r); (m[k] = m[k] || []).push(r); });
+  return m;
+}
+function currentMarking(){
+  const m = getSyllabusById(getCurrentSyllabusId()).marking || DEFAULT_MARKING;
+  const pos = Number(m.positive)||1, pen = (Number(m.negNum)||0)/(Number(m.negDen)||1);
+  return { pos, pen, breakEven: (pos+pen)>0 ? pen/(pos+pen) : 0 };
+}
+function diffBadgeSmall(avg){
+  if(!avg) return "";
+  const lvl = avg.avg<=4 ? "E" : avg.avg<=7 ? "M" : "D";
+  return `<span class="pill diff-pill diff-${lvl}">${avg.avg}/9</span>`;
+}
+function statsTabBarHtml(active){
+  return `<div class="segmented stats-subtabs" id="statsTabSeg">${STATS_TABS.map(([k,l])=>`<button data-t="${k}" class="${active===k?"active":""}">${l}</button>`).join("")}</div>`;
+}
+function barRowsHtml(entries, colorFn, valFn){
+  if(!entries.length) return `<div class="chart-note">No data yet.</div>`;
+  return entries.map(e=>`<div class="bar-row">
+      <div class="bar-label">${escapeHtml(e.label)}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.max(2,Math.min(100,e.pct))}%;background:${colorFn(e)};"></div></div>
+      <div class="bar-val">${valFn(e)}</div></div>`).join("");
+}
+
+function statsOverviewHtml(attempts){
   const totalAttempts = attempts.length;
   let totalGraded=0, totalCorrect=0;
   attempts.forEach(a=>{ a.answers.forEach(r=>{ if(r.isGraded){ totalGraded++; if(r.isCorrect) totalCorrect++; } }); });
@@ -2453,16 +2854,12 @@ function renderStatsScreen(){
   const { streak, today } = computeStreak();
   const wrongQs = collectWrongQuestions();
   const flaggedQs = collectFlaggedQuestions();
-
-  let html = `<div class="detail-head"><div style="width:100%"><h2>Performance</h2><div class="meta">${escapeHtml(getSyllabusById(cur).name)} syllabus</div></div></div>`;
-
-  html += `<div class="stat-cards">
+  let html = `<div class="stat-cards">
     <div class="stat-card"><div class="num">${totalAttempts}</div><div class="label">Tests taken</div></div>
     <div class="stat-card"><div class="num">${overallPct===null?"—":overallPct+"%"}</div><div class="label">Accuracy</div></div>
     <div class="stat-card"><div class="num">🔥${streak}</div><div class="label">Day streak</div></div>
     <div class="stat-card"><div class="num">${today}</div><div class="label">Today</div></div>
   </div>`;
-
   html += `<div class="chart-block">
     <div class="chart-title">Quick practice</div>
     <div style="display:flex;gap:8px;margin-bottom:8px;">
@@ -2474,99 +2871,231 @@ function renderStatsScreen(){
       <button class="iconbtn" id="mockExamBtn" style="flex:1;justify-content:center;">🎯 Mock exam</button>
     </div>
   </div>`;
-
   const due = dueForReviewList();
   if(due.length>0){
-    html += `<div class="chart-block">
-      <div class="chart-title">Due for review (${due.length})</div>
+    html += `<div class="chart-block"><div class="chart-title">Due for review (${due.length})</div>
       <div class="chart-note">Based on a spaced-repetition schedule from when you last marked each topic studied.</div>
       <div style="max-height:240px;overflow-y:auto;">`;
     due.slice(0,40).forEach(d=>{
       const daysOverdue = Math.floor((Date.now()-d.info.nextReviewAt)/86400000);
       html += `<button type="button" class="priority-row" style="width:100%;text-align:left;background:none;border:none;cursor:pointer;" data-due-subject="${escapeHtml(d.subject)}" data-due-topic="${escapeHtml(d.topic)}">
         <div class="pr-main"><div class="pr-title">${escapeHtml(d.topic)}</div><div class="pr-sub">${escapeHtml(d.subject)} · studied ${d.info.count}×</div></div>
-        <span class="pr-badge weak">${daysOverdue<=0?"due today":daysOverdue+"d overdue"}</span>
-      </button>`;
+        <span class="pr-badge weak">${daysOverdue<=0?"due today":daysOverdue+"d overdue"}</span></button>`;
     });
     html += `</div></div>`;
   }
-
   if(totalAttempts===0){
     html += emptyState("No practice tests yet", "Start one from any paper, subject, or topic listing to see your stats here.");
-    mainEl.innerHTML = html;
-    bindStatsQuickActions();
-    document.querySelectorAll("[data-due-subject]").forEach(btn=>{
-      btn.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: btn.dataset.dueSubject, topic: btn.dataset.dueTopic }));
-    });
-    return;
+    return html;
   }
-
   const recent = [...attempts].sort((a,b)=> new Date(a.timestamp)-new Date(b.timestamp)).slice(-10);
   html += `<div class="chart-block"><div class="chart-title">Recent test scores</div>`;
   recent.forEach(a=>{
     const pct = a.totalCount? Math.round(100*a.correctCount/a.totalCount):0;
     const color = pct>=70? "var(--good)" : pct>=40? "var(--gold)" : "var(--bad)";
-    html += `<div class="bar-row">
-      <div class="bar-label">${escapeHtml(new Date(a.timestamp).toLocaleDateString())}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div>
-      <div class="bar-val">${pct}%</div>
-    </div>`;
+    html += `<div class="bar-row"><div class="bar-label">${escapeHtml(new Date(a.timestamp).toLocaleDateString())}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div><div class="bar-val">${pct}%</div></div>`;
   });
-  html += `</div>`;
+  return html + `</div>`;
+}
 
-  // Sortable, drill-down subject performance
+function statsSubjectsHtml(screen){
   const sortMode = screen.statsSort || "weak";
   const subjAccMap = computeAccuracyBySubject();
   const subjCounts = computeQuestionCountsBySubject();
+  const qs = visibleQuestions();
   let subjRows = Object.keys(subjCounts).map(s=>{
     const acc = subjAccMap[s];
     const practiced = !!acc && acc.total>0;
-    const pct = practiced ? Math.round(100*acc.correct/acc.total) : null;
-    return { subject:s, freq:subjCounts[s], practiced, pct, answered: practiced?acc.total:0 };
+    return { subject:s, freq:subjCounts[s], practiced, pct: practiced? Math.round(100*acc.correct/acc.total):null,
+      answered: practiced?acc.total:0, diff: avgDifficulty(qs.filter(q=>q.subject===s)) };
   });
   if(sortMode==="strong") subjRows.sort((a,b)=> (b.pct===null?-1:b.pct) - (a.pct===null?-1:a.pct));
   else if(sortMode==="most") subjRows.sort((a,b)=> b.freq-a.freq);
+  else if(sortMode==="hard") subjRows.sort((a,b)=> (b.diff?b.diff.avg:0)-(a.diff?a.diff.avg:0));
   else subjRows.sort((a,b)=> (a.pct===null?-1:a.pct) - (b.pct===null?-1:b.pct));
-
-  html += `<div class="chart-block">
+  let html = `<div class="chart-block">
     <div class="chart-title">Subject performance — tap to see its topics</div>
+    <button class="iconbtn" id="allTopicsBtn" style="width:100%;justify-content:center;margin:6px 0 10px;">📋 View all topics of all subjects</button>
     <div class="segmented" id="statsSortSeg">
-      <button data-s="weak" class="${sortMode==='weak'?'active':''}">Weakest first</button>
-      <button data-s="strong" class="${sortMode==='strong'?'active':''}">Strongest first</button>
-      <button data-s="most" class="${sortMode==='most'?'active':''}">Most in bank</button>
-    </div>
-    <div style="max-height:400px;overflow-y:auto;margin-top:8px;">`;
+      <button data-s="weak" class="${sortMode==='weak'?'active':''}">Weakest</button>
+      <button data-s="strong" class="${sortMode==='strong'?'active':''}">Strongest</button>
+      <button data-s="most" class="${sortMode==='most'?'active':''}">Most</button>
+      <button data-s="hard" class="${sortMode==='hard'?'active':''}">Hardest</button>
+    </div><div style="margin-top:8px;">`;
   subjRows.forEach((r,idx)=>{
-    const pctLabel = r.practiced ? r.pct+"%" : "Not tried";
     html += `<div class="priority-row" style="cursor:pointer;" data-stats-subject="${escapeHtml(r.subject)}">
       <div class="pr-rank">${idx+1}</div>
-      <div class="pr-main"><div class="pr-title">${escapeHtml(r.subject)}</div><div class="pr-sub">${r.freq} question${r.freq===1?"":"s"} in bank${r.practiced?` · ${r.answered} answered`:""}</div></div>
-      <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${pctLabel}</span>
-    </div>`;
+      <div class="pr-main"><div class="pr-title">${escapeHtml(r.subject)}</div><div class="pr-sub">${r.freq} q in bank${r.practiced?` · ${r.answered} answered`:""} ${diffBadgeSmall(r.diff)}</div></div>
+      <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${r.practiced? r.pct+"%":"Not tried"}</span></div>`;
   });
-  html += `</div></div>`;
+  return html + `</div></div>`;
+}
 
-  const timeStats = computeTimeStats();
-  const subjTimeEntries = Object.entries(timeStats.bySubject).map(([s,v])=>({label:s, avgMs: v.totalMs/v.count})).sort((a,b)=>b.avgMs-a.avgMs).slice(0,8);
-  const topicTimeEntries = Object.values(timeStats.byTopic).map(v=>({label:`${v.topic} (${v.subject})`, avgMs: v.totalMs/v.count})).sort((a,b)=>b.avgMs-a.avgMs).slice(0,8);
-  if(subjTimeEntries.length){
-    html += timeStatsBlockHtml("Avg time per question by subject (slowest first)", subjTimeEntries);
-    html += timeStatsBlockHtml("Avg time per question by topic (slowest first)", topicTimeEntries);
-  } else {
-    html += `<div class="chart-note" style="margin:14px 2px;">Time-per-question stats appear once you take a test in swipe view (timing isn't tracked in scroll view).</div>`;
-  }
+function statsTimeHtml(recs){
+  const timed = recs.filter(r=> r.timeMs>0);
+  if(!timed.length) return `<div class="chart-note" style="margin:14px 2px;">Time stats appear once you take a test in swipe view (timing isn't tracked in scroll view).</div>`;
+  const avgOf = arr => arr.reduce((s,r)=>s+r.timeMs,0)/arr.length;
+  let html = `<div class="stat-cards">
+    <div class="stat-card"><div class="num">${formatDuration(avgOf(timed))}</div><div class="label">Avg / question</div></div>
+    <div class="stat-card"><div class="num">${timed.length}</div><div class="label">Timed answers</div></div></div>`;
+  const byDiff = aggregateBy(timed.filter(r=>r.difficulty), r=>r.difficulty);
+  const diffEntries = ["E","M","D"].filter(d=>byDiff[d]).map(d=>({label:`${DIFFICULTY_LABELS[d]} (${byDiff[d].length})`, avg:avgOf(byDiff[d])}));
+  const mx = Math.max(1,...diffEntries.map(e=>e.avg));
+  html += `<div class="chart-block"><div class="chart-title">Avg time by difficulty</div>${barRowsHtml(diffEntries.map(e=>({label:e.label,pct:100*e.avg/mx,avg:e.avg})), ()=>"var(--gold)", e=>formatDuration(e.avg))}</div>`;
+  const bySubj = aggregateBy(timed, r=>r.subject);
+  const subjEntries = Object.entries(bySubj).map(([s,a])=>({label:s,avg:avgOf(a)})).sort((a,b)=>b.avg-a.avg);
+  const mxs = Math.max(1,...subjEntries.map(e=>e.avg));
+  html += `<div class="chart-block"><div class="chart-title">Avg time by subject (slowest first)</div><div style="max-height:300px;overflow-y:auto;">${barRowsHtml(subjEntries.map(e=>Object.assign(e,{pct:100*e.avg/mxs})), ()=>"var(--gold)", e=>formatDuration(e.avg))}</div></div>`;
+  const byTopic = aggregateBy(timed, r=>`${r.subject}|||${r.topic}`);
+  const topicEntries = Object.entries(byTopic).map(([k,a])=>({label:`${k.split("|||")[1]} (${k.split("|||")[0]})`,avg:avgOf(a)})).sort((a,b)=>b.avg-a.avg);
+  const mxt = Math.max(1,...topicEntries.map(e=>e.avg));
+  html += `<div class="chart-block"><div class="chart-title">Avg time by topic (slowest first)</div><div style="max-height:360px;overflow-y:auto;">${barRowsHtml(topicEntries.map(e=>Object.assign(e,{pct:100*e.avg/mxt})), ()=>"var(--gold)", e=>formatDuration(e.avg))}</div></div>`;
+  // time per difficulty, subject-wise and topic-wise
+  const cell = (arr,d)=>{ const x=(arr||[]).filter(r=>r.difficulty===d); return x.length? formatDuration(avgOf(x)) : "—"; };
+  const tbl = (groups, labelFn)=>`<div style="max-height:320px;overflow:auto;"><table class="diff-table"><tr><th>&nbsp;</th><th>Easy</th><th>Med</th><th>Hard</th></tr>${
+    Object.entries(groups).map(([k,a])=>`<tr><td>${escapeHtml(labelFn(k))}</td><td>${cell(a,"E")}</td><td>${cell(a,"M")}</td><td>${cell(a,"D")}</td></tr>`).join("")}</table></div>`;
+  html += `<div class="chart-block"><div class="chart-title">Avg time by difficulty — subject-wise</div>${tbl(bySubj,k=>k)}</div>`;
+  html += `<div class="chart-block"><div class="chart-title">Avg time by difficulty — topic-wise</div>${tbl(byTopic,k=>k.split("|||")[1]+" · "+k.split("|||")[0])}</div>`;
+  return html;
+}
 
+function statsDifficultyHtml(recs){
+  if(!isDifficultyMarkingEnabled()) return `<div class="chart-note" style="margin:14px 2px;">Difficulty marking is switched off. Turn it on from ⚙️ below to mark and analyse question difficulty.</div>`;
+  const qs = visibleQuestions();
+  const overall = avgDifficulty(qs);
+  let html = `<div class="chart-note">Easy = 3, Medium = 6, Difficult = 9. Averages count only questions you have marked, shown as “n/total marked”.</div>`;
+  html += `<div class="stat-cards">
+    <div class="stat-card"><div class="num">${overall?overall.avg:"—"}</div><div class="label">Avg difficulty /9</div></div>
+    <div class="stat-card"><div class="num">${overall?overall.count:0}/${qs.length}</div><div class="label">Marked</div></div></div>`;
+  const dist = {E:0,M:0,D:0}; qs.forEach(q=>{ if(dist[q.difficulty]!==undefined) dist[q.difficulty]++; });
+  const dmax = Math.max(1,dist.E,dist.M,dist.D);
+  html += `<div class="chart-block"><div class="chart-title">Questions by difficulty</div>${barRowsHtml(["E","M","D"].map(d=>({label:DIFFICULTY_LABELS[d],pct:100*dist[d]/dmax,n:dist[d],d})), e=>e.d==="E"?"var(--good)":e.d==="M"?"var(--gold)":"var(--bad)", e=>e.n)}</div>`;
+  const graded = recs.filter(r=>r.isGraded && r.difficulty);
+  const accE = ["E","M","D"].map(d=>{ const a=graded.filter(r=>r.difficulty===d); return {label:`${DIFFICULTY_LABELS[d]} (${a.length})`, pct: a.length? 100*a.filter(r=>r.isCorrect).length/a.length:0, n:a.length, d}; });
+  html += `<div class="chart-block"><div class="chart-title">Your accuracy by difficulty</div>${graded.length? barRowsHtml(accE, e=>e.d==="E"?"var(--good)":e.d==="M"?"var(--gold)":"var(--bad)", e=>e.n?Math.round(e.pct)+"%":"—") : `<div class="chart-note">Take tests on marked questions to see this.</div>`}</div>`;
+  const rowsFor = (keyFn, labelFn)=>{
+    const g = aggregateBy(qs.filter(q=>q.difficulty), keyFn);
+    const tot = aggregateBy(qs, keyFn);
+    return Object.keys(g).map(k=>{ const a=avgDifficulty(tot[k]); return {label:labelFn(k)+` (${a.count}/${a.total})`, pct:100*a.avg/9, avg:a.avg}; }).sort((a,b)=>b.avg-a.avg);
+  };
+  const col = e=> e.avg<=4?"var(--good)":e.avg<=7?"var(--gold)":"var(--bad)";
+  html += `<div class="chart-block"><div class="chart-title">Avg difficulty by subject</div>${barRowsHtml(rowsFor(q=>q.subject,k=>k),col,e=>e.avg)}</div>`;
+  html += `<div class="chart-block"><div class="chart-title">Avg difficulty by topic</div><div style="max-height:360px;overflow-y:auto;">${barRowsHtml(rowsFor(q=>`${q.subject}|||${q.topic||FALLBACK_TOPIC}`,k=>k.split("|||")[1]+" · "+k.split("|||")[0]),col,e=>e.avg)}</div></div>`;
+  const byPaper = aggregateBy(qs.filter(q=>q.difficulty), q=>q._paperId);
+  const totPaper = aggregateBy(qs, q=>q._paperId);
+  const paperRows = Object.keys(byPaper).map(k=>{ const a=avgDifficulty(totPaper[k]); const nm=(DATA.papers.find(p=>p.id===k)||{}).name||k; return {label:`${nm} (${a.count}/${a.total})`,pct:100*a.avg/9,avg:a.avg}; }).sort((a,b)=>b.avg-a.avg);
+  html += `<div class="chart-block"><div class="chart-title">Avg difficulty by exam</div>${barRowsHtml(paperRows,col,e=>e.avg)}</div>`;
+  return html;
+}
+
+function guessSummary(arr, mk){
+  const g = arr.filter(r=>r.guessed && r.isGraded && r.selectedIndex!==null && r.selectedIndex!==undefined);
+  const right = g.filter(r=>r.isCorrect).length, wrong = g.length-right;
+  const net = right*mk.pos - wrong*mk.pen;
+  return { n:g.length, right, wrong, net: Math.round(net*100)/100, acc: g.length? right/g.length : null };
+}
+function statsGuessHtml(recs, screen){
+  const mk = currentMarking();
+  const all = guessSummary(recs, mk);
+  let html = `<div class="chart-block"><div class="chart-title">How guessing pays off</div>
+    <div class="chart-note">Marking: +${mk.pos} right, −${Math.round(mk.pen*100)/100} wrong. Break-even accuracy = penalty ÷ (mark + penalty) = <b>${Math.round(mk.breakEven*1000)/10}%</b>. Guess only when your chance of being right is above this; below it, guessing loses marks on average.</div></div>`;
+  if(!all.n) return html + `<div class="chart-note" style="margin:14px 2px;">Tap “🤔 Guess” on a question during a test to start collecting guess data.</div>`;
+  const marks = r=> (r>0?"+":"")+r;
+  const verdict = all.acc>=mk.breakEven ? "👍 Your guesses are paying off" : "⚠️ Your guesses are costing marks";
+  html += `<div class="stat-cards">
+    <div class="stat-card"><div class="num">${all.n}</div><div class="label">Guessed</div></div>
+    <div class="stat-card"><div class="num">${Math.round(all.acc*100)}%</div><div class="label">Guess accuracy</div></div>
+    <div class="stat-card"><div class="num" style="color:${all.net>=0?"var(--good)":"var(--bad)"}">${marks(all.net)}</div><div class="label">Net marks</div></div>
+    <div class="stat-card"><div class="num">${all.right}✓ ${all.wrong}✗</div><div class="label">Right / wrong</div></div></div>
+    <div class="chart-note" style="margin:0 2px 10px;">${verdict} (break-even ${Math.round(mk.breakEven*100)}%). Marks gained: +${Math.round(all.right*mk.pos*100)/100}, lost: −${Math.round(all.wrong*mk.pen*100)/100}.</div>`;
+  const mode = screen.guessScope || "subject", sort = screen.guessSort || "net-asc";
+  const groups = aggregateBy(recs.filter(r=>r.guessed), r=> mode==="subject"? r.subject : `${r.subject}|||${r.topic}`);
+  let rows = Object.entries(groups).map(([k,a])=>{ const s=guessSummary(a,mk); return Object.assign(s,{label: mode==="subject"?k:k.split("|||")[1]+" · "+k.split("|||")[0]}); }).filter(s=>s.n>0);
+  if(sort==="net-asc") rows.sort((a,b)=>a.net-b.net); else if(sort==="net-desc") rows.sort((a,b)=>b.net-a.net); else rows.sort((a,b)=>b.n-a.n);
+  html += `<div class="segmented" id="guessScopeSeg"><button data-g="subject" class="${mode==='subject'?'active':''}">By subject</button><button data-g="topic" class="${mode==='topic'?'active':''}">By topic</button></div>
+    <div class="segmented" id="guessSortSeg" style="margin-top:6px;"><button data-g="net-asc" class="${sort==='net-asc'?'active':''}">Most lost</button><button data-g="net-desc" class="${sort==='net-desc'?'active':''}">Most gained</button><button data-g="count" class="${sort==='count'?'active':''}">Most guesses</button></div>
+    <div style="margin-top:8px;max-height:420px;overflow-y:auto;">`;
+  rows.forEach((r,i)=>{
+    html += `<div class="priority-row"><div class="pr-rank">${i+1}</div>
+      <div class="pr-main"><div class="pr-title">${escapeHtml(r.label)}</div><div class="pr-sub">${r.n} guessed · ${r.right}✓ ${r.wrong}✗ · ${Math.round(r.acc*100)}% ${r.acc>=mk.breakEven?"(above":"(below"} break-even)</div></div>
+      <span class="pr-badge" style="background:none;color:${r.net>=0?"var(--good)":"var(--bad)"};font-weight:600;">${marks(r.net)}</span></div>`;
+  });
+  return html + `</div>`;
+}
+
+function renderStatsScreen(){
+  const screen = currentScreen();
+  const cur = getCurrentSyllabusId();
+  const tab = screen.statsTab || "overview";
+  const attempts = (DATA.attempts||[]).filter(a=> a.type==="bank" || a.syllabus_id===cur);
+  const recs = collectAttemptRecords();
+  let html = `<div class="detail-head"><div style="width:100%"><h2>Performance</h2><div class="meta">${escapeHtml(getSyllabusById(cur).name)} syllabus</div></div></div>`;
+  html += statsTabBarHtml(tab);
+  if(tab==="overview") html += statsOverviewHtml(attempts);
+  else if(tab==="subjects") html += statsSubjectsHtml(screen);
+  else if(tab==="time") html += statsTimeHtml(recs);
+  else if(tab==="difficulty") html += statsDifficultyHtml(recs);
+  else if(tab==="guess") html += statsGuessHtml(recs, screen);
+  const on = isDifficultyMarkingEnabled();
+  html += `<div class="chart-block" style="margin-top:18px;"><label class="switch-row"><input type="checkbox" id="diffSwitch" ${on?"checked":""}> ⚙️ Allow difficulty marking (E / M / D) on questions</label></div>`;
   mainEl.innerHTML = html;
-  bindStatsQuickActions();
-  document.querySelectorAll("[data-due-subject]").forEach(btn=>{
-    btn.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: btn.dataset.dueSubject, topic: btn.dataset.dueTopic }));
+  document.querySelectorAll("#statsTabSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.statsTab = b.dataset.t; render(); }));
+  document.getElementById("diffSwitch").addEventListener("change", e=>{ setDifficultyMarkingEnabled(e.target.checked); toast(e.target.checked?"Difficulty marking on":"Difficulty marking off"); render(); });
+  if(tab==="overview"){
+    bindStatsQuickActions();
+    document.querySelectorAll("[data-due-subject]").forEach(btn=>{
+      btn.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: btn.dataset.dueSubject, topic: btn.dataset.dueTopic }));
+    });
+  }
+  if(tab==="subjects"){
+    document.querySelectorAll("#statsSortSeg button").forEach(btn=> btn.addEventListener("click", ()=>{ screen.statsSort = btn.dataset.s; render(); }));
+    document.querySelectorAll("[data-stats-subject]").forEach(row=> row.addEventListener("click", ()=> pushScreen({ type:"stats-subject", subject: row.dataset.statsSubject })));
+    document.getElementById("allTopicsBtn").addEventListener("click", ()=> pushScreen({ type:"stats-all-topics" }));
+  }
+  if(tab==="guess"){
+    const gs = document.getElementById("guessScopeSeg"), gt = document.getElementById("guessSortSeg");
+    if(gs) gs.querySelectorAll("button").forEach(b=> b.addEventListener("click", ()=>{ screen.guessScope=b.dataset.g; render(); }));
+    if(gt) gt.querySelectorAll("button").forEach(b=> b.addEventListener("click", ()=>{ screen.guessSort=b.dataset.g; render(); }));
+  }
+}
+
+function renderStatsAllTopics(){
+  const screen = currentScreen();
+  const sortMode = screen.statsSortAll || "weak";
+  const topicAccMap = computeAccuracyByTopic();
+  const topicCounts = computeQuestionCountsByTopic();
+  const qs = visibleQuestions();
+  let rows = Object.keys(topicCounts).map(k=>{
+    const [subject, topic] = k.split("|||");
+    const acc = topicAccMap[k];
+    const practiced = !!acc && acc.total>0;
+    return { subject, topic, freq: topicCounts[k], practiced, pct: practiced? Math.round(100*acc.correct/acc.total):null,
+      diff: avgDifficulty(qs.filter(q=>q.subject===subject && (q.topic||FALLBACK_TOPIC)===topic)) };
   });
-  document.querySelectorAll("#statsSortSeg button").forEach(btn=>{
-    btn.addEventListener("click", ()=>{ screen.statsSort = btn.dataset.s; render(); });
+  if(sortMode==="strong") rows.sort((a,b)=> (b.pct===null?-1:b.pct)-(a.pct===null?-1:a.pct));
+  else if(sortMode==="most") rows.sort((a,b)=> b.freq-a.freq);
+  else if(sortMode==="hard") rows.sort((a,b)=> (b.diff?b.diff.avg:0)-(a.diff?a.diff.avg:0));
+  else if(sortMode==="az") rows.sort((a,b)=> a.topic.localeCompare(b.topic));
+  else rows.sort((a,b)=> (a.pct===null?-1:a.pct)-(b.pct===null?-1:b.pct));
+  let html = `<div class="detail-head"><div style="width:100%"><div class="backrow" id="backBtn">‹ Back to Stats</div>
+    <h2>All topics</h2><div class="meta">${rows.length} topics across all subjects</div></div></div>
+    <div class="segmented" id="allSortSeg">
+      <button data-s="weak" class="${sortMode==='weak'?'active':''}">Weakest</button>
+      <button data-s="strong" class="${sortMode==='strong'?'active':''}">Strongest</button>
+      <button data-s="most" class="${sortMode==='most'?'active':''}">Most</button>
+      <button data-s="hard" class="${sortMode==='hard'?'active':''}">Hardest</button>
+      <button data-s="az" class="${sortMode==='az'?'active':''}">A–Z</button></div><div style="margin-top:8px;">`;
+  rows.forEach((r,idx)=>{
+    html += `<div class="priority-row" style="cursor:pointer;" data-subj="${escapeHtml(r.subject)}" data-topic="${escapeHtml(r.topic)}">
+      <div class="pr-rank">${idx+1}</div>
+      <div class="pr-main"><div class="pr-title">${escapeHtml(r.topic)} ${labelPillHtml(r.subject,r.topic)}</div><div class="pr-sub">${escapeHtml(r.subject)} · ${r.freq} q ${diffBadgeSmall(r.diff)}</div></div>
+      <span class="pr-badge" style="background:none;color:${accColor(r.practiced,r.pct)};font-weight:600;">${r.practiced? r.pct+"%":"Not tried"}</span></div>`;
   });
-  document.querySelectorAll("[data-stats-subject]").forEach(row=>{
-    row.addEventListener("click", ()=> pushScreen({ type:"stats-subject", subject: row.dataset.statsSubject }));
-  });
+  mainEl.innerHTML = html + `</div>`;
+  document.getElementById("backBtn").addEventListener("click", popScreen);
+  document.querySelectorAll("#allSortSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.statsSortAll=b.dataset.s; render(); }));
+  document.querySelectorAll("[data-topic]").forEach(row=> row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject:row.dataset.subj, topic:row.dataset.topic })));
 }
 
 function renderStatsSubject(subject){
@@ -2637,6 +3166,216 @@ function renderFlaggedList(){
     questions,
     allowPractice: true,
     practiceInfo: { sourceType:"flagged", scopeKey:"flagged", scopeLabel:"Flagged questions", syllabusId: getCurrentSyllabusId() }
+  });
+}
+
+/* ================= Notes tab ================= */
+function renderNotesRoot(){
+  const searchTerm = getSearch();
+  const notedAll = collectNotedQuestions().filter(q=>(q._syllabusId||"default")===getCurrentSyllabusId());
+  const noted = searchTerm ? notedAll.filter(q=> q.note.toLowerCase().includes(searchTerm.toLowerCase()) || q.question_text.toLowerCase().includes(searchTerm.toLowerCase())) : notedAll;
+
+  if(notedAll.length===0){
+    mainEl.innerHTML = emptyState("No notes yet", "Tap the 📄/🗒️ icon on any question to jot down your thoughts — they'll all show up here.");
+    return;
+  }
+  let html = `<input class="search" id="searchBox" placeholder="Search notes…" value="${escapeHtml(searchTerm)}">`;
+  html += `<div id="listWrap">`;
+  noted.forEach((q, idx)=>{
+    html += `<div class="row" data-paper-id="${escapeHtml(q._paperId)}" data-qid="${escapeHtml(q.id)}">
+      <div class="num">${String(idx+1).padStart(2,"0")}</div>
+      <div class="main">
+        <div class="title">${escapeHtml(q.note.slice(0,70))}${q.note.length>70?"…":""}</div>
+        <div class="sub">${escapeHtml(q._paperName)} · ${escapeHtml(q.subject)} · ${escapeHtml(q.topic||FALLBACK_TOPIC)}</div>
+      </div>
+      <div class="count">→</div>
+    </div>`;
+  });
+  html += `</div>`;
+  mainEl.innerHTML = html;
+  document.querySelectorAll("#listWrap .row").forEach(row=>{
+    row.addEventListener("click", ()=> pushScreen({ type:"paper-detail", paperId: row.dataset.paperId }));
+  });
+  bindSearchInput(renderNotesRoot);
+}
+
+/* ================= Topic priority lists ================= */
+function renderTopicListsRoot(){
+  const lists = DATA.topicLists||[];
+  let html = `<div style="display:flex;gap:8px;margin-bottom:10px;">
+    <button class="iconbtn primary" id="newListBtn" style="flex:1;justify-content:center;">+ New list</button>
+  </div>`;
+  if(lists.length===0){
+    html += emptyState("No topic lists yet", "Create a named list (e.g. \"Must revise before exam\") and add topics to it from across your syllabus.");
+  } else {
+    html += `<div id="listWrap">`;
+    lists.forEach((l, idx)=>{
+      html += rowHtml({
+        num: String(idx+1).padStart(2,"0"),
+        title: l.name,
+        sub: `${l.items.length} topic${l.items.length===1?"":"s"}`,
+        count: "→",
+        dataAttr: `data-list-id="${escapeHtml(l.id)}"`
+      });
+    });
+    html += `</div>`;
+  }
+  mainEl.innerHTML = html;
+  document.getElementById("newListBtn").addEventListener("click", ()=>{
+    const name = prompt("Name this topic list");
+    if(name && name.trim()){
+      const list = { id: slugify(name), name: name.trim(), items: [] };
+      DATA.topicLists.push(list);
+      saveData(DATA);
+      pushScreen({ type:"topic-list-detail", listId: list.id });
+    }
+  });
+  document.querySelectorAll("#listWrap .row").forEach(row=>{
+    row.addEventListener("click", ()=> pushScreen({ type:"topic-list-detail", listId: row.dataset.listId }));
+  });
+}
+
+function renderTopicListDetail(listId){
+  const list = findTopicList(listId);
+  if(!list){ popScreen(); return; }
+  const qs = visibleQuestions();
+  const counts = {};
+  qs.forEach(q=>{ const k=`${q.subject}|||${q.topic||FALLBACK_TOPIC}`; counts[k]=(counts[k]||0)+1; });
+
+  let html = `<div class="detail-head">
+    <div style="width:100%">
+      <div class="backrow" id="backBtn">‹ Back to My lists</div>
+      <h2>${escapeHtml(list.name)}</h2>
+      <div class="meta">${list.items.length} topic${list.items.length===1?"":"s"}</div>
+    </div>
+  </div>`;
+  html += `<div style="display:flex;gap:8px;margin:10px 0;">
+    <button class="iconbtn" id="renameListBtn" style="flex:1;justify-content:center;">Rename</button>
+    <button class="iconbtn" id="addTopicsBtn" style="flex:1;justify-content:center;">+ Add topics</button>
+    <button class="iconbtn" id="deleteListBtn" style="border-color:var(--maroon);color:#f0a3ab;">🗑</button>
+  </div>`;
+
+  if(list.items.length===0){
+    html += emptyState("No topics in this list yet", "");
+  } else {
+    html += `<div id="listWrap">`;
+    list.items.forEach((it, idx)=>{
+      const key = `${it.subject}|||${it.topic}`;
+      html += `<div class="row" data-subject="${escapeHtml(it.subject)}" data-topic="${escapeHtml(it.topic)}">
+        <div class="num">${String(idx+1).padStart(2,"0")}</div>
+        <div class="main">
+          <div class="title">${escapeHtml(it.topic)}</div>
+          <div class="sub">${escapeHtml(it.subject)}</div>
+        </div>
+        <div class="count">${counts[key]||0} q</div>
+        <button class="actbtn danger" data-remove-item="${escapeHtml(key)}" title="Remove from list">✕</button>
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  mainEl.innerHTML = html;
+  document.getElementById("backBtn").addEventListener("click", popScreen);
+  document.getElementById("renameListBtn").addEventListener("click", ()=>{
+    const name = prompt("Rename list", list.name);
+    if(name && name.trim()){ list.name = name.trim(); saveData(DATA); render(); }
+  });
+  document.getElementById("deleteListBtn").addEventListener("click", ()=>{
+    if(confirm(`Delete the list "${list.name}"? This doesn't affect the topics or questions themselves.`)){
+      DATA.topicLists = DATA.topicLists.filter(l=>l.id!==listId);
+      saveData(DATA);
+      popScreen();
+    }
+  });
+  document.getElementById("addTopicsBtn").addEventListener("click", ()=> openTopicListPickerModal(listId));
+  document.querySelectorAll("[data-remove-item]").forEach(btn=>{
+    btn.addEventListener("click", (e)=>{
+      e.stopPropagation();
+      const [subject, topic] = btn.dataset.removeItem.split("|||");
+      removeTopicFromList(listId, subject, topic);
+      render();
+    });
+  });
+  document.querySelectorAll("#listWrap .row").forEach(row=>{
+    row.addEventListener("click", ()=> pushScreen({ type:"topic-detail", subject: row.dataset.subject, topic: row.dataset.topic }));
+  });
+}
+
+function openTopicListPickerModal(listId){
+  const qs = visibleQuestions();
+  const counts = {};
+  qs.forEach(q=>{ const k=`${q.subject}|||${q.topic||FALLBACK_TOPIC}`; counts[k]=(counts[k]||0)+1; });
+  const all = Object.keys(counts).map(k=>{ const [subject,topic]=k.split("|||"); return {subject,topic,count:counts[k]}; })
+    .sort((a,b)=> a.subject.localeCompare(b.subject) || a.topic.localeCompare(b.topic));
+  const list = findTopicList(listId);
+  const already = new Set(list.items.map(it=>`${it.subject}|||${it.topic}`));
+  let term = "";
+
+  function filtered(){
+    const t = term.toLowerCase();
+    return all.filter(x=> !already.has(`${x.subject}|||${x.topic}`) && (!t || x.topic.toLowerCase().includes(t) || x.subject.toLowerCase().includes(t)));
+  }
+  function draw(){
+    modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="backdrop">
+      <div class="modal">
+        <h3>Add topics to "${escapeHtml(list.name)}"</h3>
+        <input class="search" id="tlpSearch" placeholder="Search topics or subjects…" value="${escapeHtml(term)}">
+        <div style="max-height:46vh;overflow-y:auto;margin-top:8px;">
+          ${filtered().map(x=>`<button type="button" class="check-item" data-subject="${escapeHtml(x.subject)}" data-topic="${escapeHtml(x.topic)}">
+            <span style="flex:1;"><div>${escapeHtml(x.topic)}</div><div class="ci-sub">${escapeHtml(x.subject)} · ${x.count} q</div></span>
+          </button>`).join("") || `<div class="meta">No more topics match.</div>`}
+        </div>
+        <div class="row-btns"><button class="iconbtn" id="closeTlp" style="width:100%;justify-content:center;">Done</button></div>
+      </div>
+    </div>`;
+    document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop"){ closeModal(); render(); } });
+    document.getElementById("closeTlp").addEventListener("click", ()=>{ closeModal(); render(); });
+    document.getElementById("tlpSearch").addEventListener("input",(e)=>{
+      const pos = e.target.selectionStart;
+      term = e.target.value; draw();
+      const nb = document.getElementById("tlpSearch");
+      if(nb){ nb.focus(); nb.setSelectionRange(pos,pos); }
+    });
+    document.querySelectorAll("[data-subject][data-topic]").forEach(btn=>{
+      btn.addEventListener("click", ()=>{
+        addTopicToList(listId, btn.dataset.subject, btn.dataset.topic);
+        already.add(`${btn.dataset.subject}|||${btn.dataset.topic}`);
+        draw();
+      });
+    });
+  }
+  draw();
+}
+
+/* ================= Topic label modal ================= */
+function openTopicLabelModal(subject, topic){
+  const current = getTopicLabel(subject, topic);
+  modalRoot.innerHTML = `
+  <div class="modal-backdrop" id="backdrop">
+    <div class="modal">
+      <h3>Label this topic</h3>
+      <div class="meta" style="margin-bottom:10px;">${escapeHtml(subject)} — ${escapeHtml(topic)}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+        ${TOPIC_LABEL_PALETTE.map(p=>`<button type="button" class="label-swatch ${current&&current.name===p.name?"selected":""}" data-name="${escapeHtml(p.name)}" data-color="${p.color}" style="background:${p.color};"></button>`).join("")}
+      </div>
+      <div class="row-btns">
+        ${current ? `<button class="iconbtn" id="clearLabelBtn" style="flex:1;justify-content:center;">Remove label</button>` : ""}
+        <button class="iconbtn" id="closeLabelModal" style="flex:1;justify-content:center;">Close</button>
+      </div>
+    </div>
+  </div>`;
+  document.getElementById("backdrop").addEventListener("click",(e)=>{ if(e.target.id==="backdrop") closeModal(); });
+  document.getElementById("closeLabelModal").addEventListener("click", closeModal);
+  const clearBtn = document.getElementById("clearLabelBtn");
+  if(clearBtn) clearBtn.addEventListener("click", ()=>{ setTopicLabel(subject, topic, null); closeModal(); render(); toast("Label removed"); });
+  document.querySelectorAll(".label-swatch").forEach(btn=>{
+    btn.addEventListener("click", ()=>{
+      setTopicLabel(subject, topic, { name: btn.dataset.name, color: btn.dataset.color });
+      closeModal();
+      render();
+      toast(`Labeled "${btn.dataset.name}"`);
+    });
   });
 }
 
@@ -2836,6 +3575,7 @@ function renderTopicModal(paperId, qid, currentSubject, currentTopic, searchTerm
   <div class="modal-backdrop" id="backdrop">
     <div class="modal">
       <h3>Reassign topic</h3>
+      <div class="meta" style="margin-bottom:8px;">Changes this one question only. To rename a topic everywhere it's used, open that topic's page and use "Rename topic" instead.</div>
       <input class="search" id="topicSearch" placeholder="Search topics or subjects…" value="${escapeHtml(searchTerm)}">
       <div id="topicGroups" style="max-height:42vh;overflow-y:auto;margin:10px 0;">${groupsHtml}</div>
       <div class="divider">— or add a new topic —</div>
@@ -2908,6 +3648,7 @@ function renderSubjectModal(paperId, qid, currentSubject, searchTerm){
   <div class="modal-backdrop" id="backdrop">
     <div class="modal">
       <h3>Reassign subject</h3>
+      <div class="meta" style="margin-bottom:8px;">Changes this one question only. To rename a subject everywhere it's used, open that subject's page and use "Rename subject" instead.</div>
       <input class="search" id="subjectSearch" placeholder="Search subjects…" value="${escapeHtml(searchTerm)}">
       <div id="subjectList" style="max-height:42vh;overflow-y:auto;margin:10px 0;">${listHtml}</div>
       <div class="divider">— or add a new subject —</div>
@@ -3502,7 +4243,11 @@ function openDataModal(){
         attempts: importedAttempts !== null ? importedAttempts : (DATA.attempts||[]),
         banks: Array.isArray(pendingImportData.banks) ? pendingImportData.banks : (DATA.banks||[]),
         syllabuses: Array.isArray(pendingImportData.syllabuses) && pendingImportData.syllabuses.length ? pendingImportData.syllabuses : DATA.syllabuses,
-        paperTemplates: Array.isArray(pendingImportData.paperTemplates) ? pendingImportData.paperTemplates : (DATA.paperTemplates||[])
+        paperTemplates: Array.isArray(pendingImportData.paperTemplates) ? pendingImportData.paperTemplates : (DATA.paperTemplates||[]),
+        topicLists: Array.isArray(pendingImportData.topicLists) ? pendingImportData.topicLists : (DATA.topicLists||[]),
+        topicLabels: (pendingImportData.topicLabels && typeof pendingImportData.topicLabels==="object") ? pendingImportData.topicLabels : (DATA.topicLabels||{}),
+        studyProgress: (pendingImportData.studyProgress && typeof pendingImportData.studyProgress==="object") ? pendingImportData.studyProgress : (DATA.studyProgress||{}),
+        dailyActivity: (pendingImportData.dailyActivity && typeof pendingImportData.dailyActivity==="object") ? pendingImportData.dailyActivity : (DATA.dailyActivity||{})
       };
     } else {
       const byId = {};
@@ -3516,7 +4261,10 @@ function openDataModal(){
         importedAttempts.forEach(a=>byAttemptId[a.id]=a);
         attempts = Object.values(byAttemptId);
       }
-      DATA = { papers: Object.values(byId), attempts, banks: DATA.banks||[], syllabuses: DATA.syllabuses, paperTemplates: DATA.paperTemplates||[] };
+      DATA = {
+        papers: Object.values(byId), attempts, banks: DATA.banks||[], syllabuses: DATA.syllabuses, paperTemplates: DATA.paperTemplates||[],
+        topicLists: DATA.topicLists||[], topicLabels: DATA.topicLabels||{}, studyProgress: DATA.studyProgress||{}, dailyActivity: DATA.dailyActivity||{}
+      };
     }
     DATA = loadDataFromObject(DATA);
     saveData(DATA);
@@ -3530,6 +4278,8 @@ function loadDataFromObject(parsed){
   if(!Array.isArray(parsed.attempts)) parsed.attempts = [];
   if(!Array.isArray(parsed.banks)) parsed.banks = [];
   if(!Array.isArray(parsed.paperTemplates)) parsed.paperTemplates = [];
+  if(!Array.isArray(parsed.topicLists)) parsed.topicLists = [];
+  if(!parsed.topicLabels || typeof parsed.topicLabels !== "object") parsed.topicLabels = {};
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
   migrateStudyProgress(parsed.studyProgress);
   if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};

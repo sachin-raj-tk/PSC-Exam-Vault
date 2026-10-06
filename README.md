@@ -99,3 +99,12 @@ Your papers, answers, explanations, subjects, and topics all carry over.
 
 Tap **+ Add**, then upload or paste JSON. Use `ai-instructions-for-json.md`
 to have an AI generate it from a PDF.
+
+## New in this update
+- **Difficulty (E/M/D = 3/6/9)** on every question and during tests; averages count only marked questions ("n/total marked"). Switch it off/on at the bottom of the Stats tab.
+- **Guess marking** in tests, with a Guesswork stats sub-tab (break-even accuracy, marks gained/lost, by subject/topic) and guessed-right/wrong filters in attempt reviews.
+- **Sorting** by difficulty (and by time in test reviews) in every question list.
+- **Notes**: per-question notes plus a Notes tab linking back to the paper.
+- **Topic lists** (named, renamable, built from the syllabus) and **colour labels** for topics.
+- **Stats sub-tabs**: Overview, Subjects, Time, Difficulty, Guesswork; "View all topics" list with the same sorts.
+- Optional `"difficulty": "E"|"M"|"D"` and `"note": "..."` fields are accepted in question JSON.

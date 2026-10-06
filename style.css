@@ -165,6 +165,9 @@ main{flex:1;padding:14px 16px 90px;}
 .summary-stat.clickable{background:none;border:1px solid transparent;border-radius:8px;cursor:pointer;font-family:inherit;}
 .summary-stat.clickable:active{background:var(--ink-bg);}
 .summary-stat.clickable.active{border-color:var(--gold);background:var(--ink-bg);}
+.summary-stat.clickable{background:none;border:1px solid transparent;border-radius:8px;cursor:pointer;font-family:inherit;}
+.summary-stat.clickable:active{background:var(--ink-bg);}
+.summary-stat.clickable.active{border-color:var(--gold);background:var(--ink-bg);}
 
 /* ---- Question slip ---- */
 .slip{
@@ -214,6 +217,7 @@ main{flex:1;padding:14px 16px 90px;}
 .pill.paper{background:var(--paper-dim);color:var(--text-dim-on-paper);border-color:var(--line-on-paper);}
 .pill.post{background:#dde6f5;color:#2f4f7a;}
 .pill.time-pill{background:#eee0c7;color:#7a5a1e;}
+.pill.time-pill{background:#eee0c7;color:#7a5a1e;}
 .pill.syllabus{background:#eadcf5;color:#5a3a7a;}
 
 .actbtn{
@@ -224,6 +228,8 @@ main{flex:1;padding:14px 16px 90px;}
 .actbtn:active{background:var(--gold);}
 .actbtn.danger{color:var(--maroon);}
 .actbtn.bank-remove{color:var(--maroon);font-size:0.78rem;font-weight:600;min-width:auto;padding:6px 12px;}
+.actbtn.flagged{background:#fbeecb;border-color:var(--gold);}
+.hltext{background:#f6dc9a;color:var(--text-on-paper);padding:0 2px;border-radius:3px;}
 .actbtn.flagged{background:#fbeecb;border-color:var(--gold);}
 .hltext{background:#f6dc9a;color:var(--text-on-paper);padding:0 2px;border-radius:3px;}
 
@@ -445,3 +451,30 @@ main{flex:1;padding:14px 16px 90px;}
 @media (min-width:480px){
   .slip{padding:20px 22px 18px;}
 }
+
+/* ---- Difficulty / guess / notes / labels / stats sub-tabs ---- */
+.diff-row{display:flex;align-items:center;gap:6px;margin:8px 0;}
+.diff-label{font-size:0.78rem;color:var(--text-dim-on-paper);margin-right:2px;}
+.diff-btn{min-width:34px;height:28px;border-radius:var(--radius-pill);border:1px solid var(--line-on-paper);background:var(--paper-dim);color:var(--text-on-paper);font-weight:700;font-size:0.8rem;cursor:pointer;}
+.diff-btn.diff-E.active{background:#3E7A4F;border-color:#3E7A4F;color:#fff;}
+.diff-btn.diff-M.active{background:#E3A008;border-color:#E3A008;color:#1B1305;}
+.diff-btn.diff-D.active{background:#B14B4B;border-color:#B14B4B;color:#fff;}
+.pill.diff-pill{font-weight:700;border-color:transparent;}
+.pill.diff-pill.diff-E{background:#dcece0;color:#2d6a3e;}
+.pill.diff-pill.diff-M{background:#f6e7bd;color:#7a5a00;}
+.pill.diff-pill.diff-D{background:#f3d6d6;color:#9b3b3b;}
+.pill.guess-pill{background:#e6dcf3;color:#5a3d8a;}
+.guess-btn{display:block;width:100%;margin:8px 0 2px;padding:8px;border-radius:8px;border:1px dashed var(--line-on-paper);background:transparent;color:var(--text-dim-on-paper);font-size:0.82rem;cursor:pointer;}
+.guess-btn.active{background:#e6dcf3;border:1px solid #8a63c7;color:#4b2f78;font-weight:600;}
+.actbtn.has-note{background:#fff3c4;}
+.note-preview{margin-top:10px;padding:8px 10px;background:#fff8dc;border-left:3px solid var(--gold);border-radius:4px;font-size:0.82rem;color:var(--text-on-paper);white-space:pre-wrap;}
+.label-swatch{display:inline-block;padding:8px 14px;margin:4px 6px 4px 0;border-radius:var(--radius-pill);border:2px solid transparent;color:#fff;font-weight:600;font-size:0.85rem;cursor:pointer;}
+.label-swatch.selected{border-color:#fff;box-shadow:0 0 0 2px var(--gold);}
+.stats-subtabs{overflow-x:auto;flex-wrap:nowrap;}
+.stats-subtabs button{white-space:nowrap;flex:1 0 auto;}
+.switch-row{display:flex;align-items:center;gap:10px;font-size:0.88rem;color:var(--text-on-ink);cursor:pointer;}
+.switch-row input{width:18px;height:18px;accent-color:var(--gold);}
+.diff-table{width:100%;border-collapse:collapse;font-size:0.8rem;}
+.diff-table th,.diff-table td{padding:6px 6px;border-bottom:1px solid var(--line);text-align:center;}
+.diff-table th:first-child,.diff-table td:first-child{text-align:left;color:var(--text-on-ink);}
+.diff-table th{color:var(--text-dim-on-ink);font-weight:600;position:sticky;top:0;background:var(--ink-bg);}
