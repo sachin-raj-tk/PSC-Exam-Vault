@@ -18,6 +18,8 @@ function loadData(){
   if(!Array.isArray(parsed.topicLists)) parsed.topicLists = [];
   if(!parsed.topicLabels || typeof parsed.topicLabels !== "object") parsed.topicLabels = {};
   if(!parsed.listingNotes || typeof parsed.listingNotes !== "object") parsed.listingNotes = {};
+  if(!Array.isArray(parsed.flashcards)) parsed.flashcards = [];
+  parsed.flashcards.forEach(c=>{ if(!c.syllabus_id) c.syllabus_id = "default"; });
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
   migrateStudyProgress(parsed.studyProgress);
   if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};
@@ -227,6 +229,7 @@ function renameSubjectEverywhere(oldName, newNameRaw){
   DATA.papers.forEach(p=>{
     (p.questions||[]).forEach(q=>{ if(q.subject === oldName){ q.subject = targetName; count++; } });
   });
+  (DATA.flashcards||[]).forEach(c=>{ if(c.subject === oldName) c.subject = targetName; });
   saveData(DATA);
   return { targetName, count };
 }
@@ -251,6 +254,7 @@ function renameTopicEverywhere(subject, oldTopic, newTopicRaw){
       if(q.subject === subject && (q.topic||FALLBACK_TOPIC) === oldTopic){ q.topic = targetTopic; count++; }
     });
   });
+  (DATA.flashcards||[]).forEach(c=>{ if(c.subject === subject && (c.topic||FALLBACK_TOPIC) === oldTopic) c.topic = targetTopic; });
   saveData(DATA);
   return { targetTopic, count };
 }
@@ -571,6 +575,9 @@ function render(){
     case "stats-subject": withStatsMode(getStatsMode(), ()=>renderStatsSubject(screen.subject)); break;
     case "stats-all-topics": withStatsMode(getStatsMode(), renderStatsAllTopics); break;
     case "ai-questions": renderAiQuestions(); break;
+    case "hub-subjects": renderHubSubjects(); break;
+    case "hub-subject": renderHubSubject(); break;
+    case "flashcards": renderFlashcards(); break;
     case "flagged-list": renderFlaggedList(); break;
     case "search-results": renderSearchResults(screen); break;
     case "notes": renderNotesRoot(); break;
@@ -786,6 +793,8 @@ function listingInfo(screen){
     case "topic-detail": return { key:"topic:"+screen.subject+"|||"+screen.topic, label:"Topic: "+screen.topic+" ("+screen.subject+")", nav:{ type:"topic-detail", subject:screen.subject, topic:screen.topic } };
     case "bank-detail": { const b=(DATA.banks||[]).find(x=>x.id===screen.bankId); return { key:"bank:"+screen.bankId, label:"Bank: "+(b?b.name:screen.bankId), nav:{ type:"bank-detail", bankId:screen.bankId } }; }
     case "flagged-list": return { key:"flagged", label:"Flagged questions", nav:{ type:"flagged-list" } };
+    case "hub-subject": return { key:screen.kind+"-subject:"+screen.subject, label:(screen.kind==="ai"?"AI questions: ":"Flashcards: ")+screen.subject, nav:{ type:"hub-subject", kind:screen.kind, subject:screen.subject } };
+    case "flashcards": return { key:"fc:"+(screen.subject||"*")+"|||"+(screen.topic||"*"), label:"Flashcards"+(screen.subject?": "+screen.subject+(screen.topic?" › "+screen.topic:""):" (all)"), nav:{ type:"flashcards", subject:screen.subject||null, topic:screen.topic||null } };
     case "ai-questions": return { key:"ai:"+(screen.subject||"*")+"|||"+(screen.topic||"*"), label:"AI questions"+(screen.subject?": "+screen.subject+(screen.topic?" › "+screen.topic:""):" (all)"), nav:{ type:"ai-questions", subject:screen.subject||null, topic:screen.topic||null } };
     case "topics": if(screen.topicListSort==="lists" && screen.activeListId){ const l=findTopicList(screen.activeListId); if(l) return { key:"list:"+l.id, label:"Topic list: "+l.name, nav:{ type:"topics", topicListSort:"lists", activeListId:l.id } }; } return null;
     default: return null;
@@ -809,7 +818,7 @@ function listingNoteBlockHtml(screen){
   const n = getListingNote(info.key);
   return `<div class="listing-note-wrap"><button class="iconbtn ${n?"has-note":""}" data-listing-note="1" style="width:100%;justify-content:center;">📝 My note${n?" ✓":""} for this listing</button>
     ${n?`<div class="listing-note">${renderRichText(n.text)}</div>`:""}
-    <button class="iconbtn" data-ai="pdf" style="width:100%;justify-content:center;margin-top:6px;">📄 Study PDFs → AI questions</button></div>`;
+    <button class="iconbtn" data-ai="pdf" style="width:100%;justify-content:center;margin-top:6px;">📄 Study PDFs → questions, flashcards, notes</button></div>`;
 }
 function openListingNoteModal(info){
   const n = getListingNote(info.key);
@@ -2468,42 +2477,52 @@ function renderResultsReview({ backLabel, onBack, title, meta, answerRecords, co
 /* ================= Question Bank ================= */
 /* ================= AI-generated questions (kept apart from PYQs) ================= */
 function contentSwitchHtml(mode, subject, topic){
-  const f = q=> (!subject||q.subject===subject) && (!topic||(q.topic||FALLBACK_TOPIC)===topic);
-  const nP = visibleQuestions().filter(f).length, nA = visibleAiQuestions().filter(f).length;
+  const f = x=> (!subject||x.subject===subject) && (!topic||(x.topic||FALLBACK_TOPIC)===topic);
+  const nP = visibleQuestions().filter(f).length, nA = visibleAiQuestions().filter(f).length, nC = visibleFlashcards().filter(f).length;
   const at = `data-subject="${escapeHtml(subject||"")}" data-topic="${escapeHtml(topic||"")}"`;
   return `<div class="segmented content-seg" style="margin:10px 0 6px;">
     <button type="button" data-cs="pyq" ${at} class="${mode==="pyq"?"active":""}">📚 PYQs (${nP})</button>
-    <button type="button" data-cs="ai" ${at} class="${mode==="ai"?"active":""}">🤖 AI questions (${nA})</button></div>`;
+    <button type="button" data-cs="ai" ${at} class="${mode==="ai"?"active":""}">🤖 AI (${nA})</button>
+    <button type="button" data-cs="fc" ${at} class="${mode==="fc"?"active":""}">🃏 Cards (${nC})</button></div>`;
 }
 function aiEntryButtonHtml(){
-  const n = visibleAiQuestions().length;
-  return `<button type="button" class="iconbtn" data-open-ai="1" style="width:100%;justify-content:center;margin:0 0 8px;">🤖 AI questions (${n}) — kept separate from PYQs</button>`;
+  return `<div style="display:flex;gap:8px;margin:0 0 8px;">
+    <button type="button" class="iconbtn" data-open-hub="ai" style="flex:1;justify-content:center;">🤖 AI questions (${visibleAiQuestions().length})</button>
+    <button type="button" class="iconbtn" data-open-hub="fc" style="flex:1;justify-content:center;">🃏 Flashcards (${visibleFlashcards().length})</button></div>`;
+}
+function screenContentMode(sc){
+  if(sc.type==="ai-questions") return "ai";
+  if(sc.type==="flashcards") return "fc";
+  if(sc.type==="hub-subject" || sc.type==="hub-subjects") return sc.kind;
+  return "pyq";
 }
 document.addEventListener("click", (e)=>{
   const b = e.target.closest("[data-cs]");
   if(b){
     const to = b.dataset.cs, subject = b.dataset.subject||null, topic = b.dataset.topic||null, cur = currentScreen();
-    if(to==="ai"){
-      if(cur.type==="ai-questions") return;
-      navStack[navStack.length-1] = { type:"ai-questions", subject, topic, _pyq:cur }; render();
-    } else {
-      if(cur.type!=="ai-questions") return;
-      const back = cur._pyq || (topic ? { type:"topic-detail", subject, topic } : subject ? { type:"subject-topics", subject } : null);
-      if(!back) return;
-      navStack[navStack.length-1] = back; render();
-    }
+    const curMode = screenContentMode(cur);
+    if(curMode===to) return;
+    let next = null;
+    if(to==="pyq") next = cur._pyq || (topic ? { type:"topic-detail", subject, topic } : subject ? { type:"subject-topics", subject } : null);
+    else if(topic) next = to==="ai" ? { type:"ai-questions", subject, topic } : { type:"flashcards", subject, topic };
+    else if(subject) next = { type:"hub-subject", kind:to, subject };
+    else next = { type:"hub-subjects", kind:to };
+    if(!next) return;
+    if(to!=="pyq"){ const orig = curMode==="pyq" ? cur : cur._pyq; if(orig) next._pyq = orig; }
+    navStack[navStack.length-1] = next; render();
     return;
   }
-  const o = e.target.closest("[data-open-ai]");
-  if(o) pushScreen({ type:"ai-questions", subject:o.dataset.subject||null, topic:o.dataset.topic||null });
+  const o = e.target.closest("[data-open-hub]");
+  if(o) pushScreen({ type:"hub-subjects", kind:o.dataset.openHub });
 });
 function aiBackLabel(){
   const prev = navStack[navStack.length-2];
   if(!prev) return "Back";
   const m = { bank:"Back to Bank", topics:"Back to Topics", subjects:"Back to Subjects", stats:"Back to Stats", papers:"Back" };
   if(m[prev.type]) return m[prev.type];
-  if(prev.type==="subject-topics") return `Back to ${prev.subject}`;
+  if(prev.type==="subject-topics" || prev.type==="hub-subject") return `Back to ${prev.subject}`;
   if(prev.type==="topic-detail") return `Back to ${prev.topic}`;
+  if(prev.type==="hub-subjects") return prev.kind==="ai" ? "Back to AI questions" : "Back to Flashcards";
   return "Back";
 }
 function renderAiQuestions(){
@@ -2558,41 +2577,192 @@ function renderAiQuestions(){
     }
   });
 }
-function renderAiHub(){
-  const all = visibleAiQuestions();
-  const bySubj = {};
-  all.forEach(q=>{ const k = q.subject||"Unclassified"; (bySubj[k] = bySubj[k] || new Set()).add(q.topic||FALLBACK_TOPIC); });
-  const counts = {}; all.forEach(q=>{ const k = q.subject||"Unclassified"; counts[k]=(counts[k]||0)+1; });
-  const subs = Object.keys(counts).sort((a,b)=>a.localeCompare(b));
-  let html = `<div class="chart-note" style="margin:4px 2px 8px;">AI-generated questions live here, separate from your previous-year questions.</div>
-    <div style="display:flex;gap:8px;margin-bottom:8px;">
-      <button class="iconbtn primary" id="aiHubAll" style="flex:1;justify-content:center;" ${all.length===0?"disabled":""}>View all (${all.length})</button>
-      <button class="iconbtn" data-ai="pdf-hub" style="flex:1;justify-content:center;">📄 From a PDF</button>
-    </div>`;
-  if(!subs.length) html += emptyState("No AI questions yet", "Open a topic and use 🤖 Generate AI questions, or add a study PDF with “📄 From a PDF”.");
-  else {
-    html += `<div id="listWrap">`;
-    subs.forEach((sub,idx)=>{
-      html += rowHtml({ num:String(idx+1).padStart(2,"0"), title:sub, sub:`${bySubj[sub].size} topic${bySubj[sub].size===1?"":"s"}`, count:`${counts[sub]} q`, dataAttr:`data-ai-subject="${escapeHtml(sub)}"` });
-    });
-    html += `</div>`;
+/* ---- Flashcards store (AI-made cards from study PDFs; separate from questions) ---- */
+function visibleFlashcards(){
+  const cur = getCurrentSyllabusId();
+  return (DATA.flashcards||[]).filter(c=>(c.syllabus_id||"default")===cur);
+}
+function addFlashcards(cards){ if(!DATA.flashcards) DATA.flashcards = []; cards.forEach(c=>DATA.flashcards.push(c)); saveData(DATA); }
+function setCardStatus(id, status){
+  const c = (DATA.flashcards||[]).find(x=>x.id===id);
+  if(c){ c.status = status; c.lastAt = Date.now(); c.reviews = (c.reviews||0)+1; saveData(DATA); }
+}
+function deleteFlashcard(id){ DATA.flashcards = (DATA.flashcards||[]).filter(c=>c.id!==id); saveData(DATA); }
+
+/* ---- Generic subject → topic → items drill-down for AI questions ("ai") and flashcards ("fc") ---- */
+const HUB_META = {
+  ai:{ icon:"🤖", title:"AI questions", noun:"AI questions", unit:n=>`${n} q` },
+  fc:{ icon:"🃏", title:"Flashcards",   noun:"flashcards",   unit:n=>`${n} card${n===1?"":"s"}` }
+};
+function hubPool(kind){
+  if(kind==="ai") return visibleAiQuestions().map(q=>({ subject:q.subject||"Unclassified", topic:q.topic||FALLBACK_TOPIC, q }));
+  return visibleFlashcards().map(c=>({ subject:c.subject||"Unclassified", topic:c.topic||FALLBACK_TOPIC, c }));
+}
+function hubRows(kind, level, subject){
+  const pool = hubPool(kind).filter(x=>!subject || x.subject===subject);
+  const groups = new Map(), cur = getCurrentSyllabusId();
+  pool.forEach(x=>{
+    const key = level==="subjects" ? x.subject : x.subject+"|||"+x.topic;
+    let g = groups.get(key);
+    if(!g){ g = { subject:x.subject, topic: level==="subjects"?null:x.topic, items:[], topics:new Set() }; groups.set(key, g); }
+    g.items.push(x); g.topics.add(x.topic);
+  });
+  return Array.from(groups.values()).map(g=>{
+    const n = g.items.length, bits = [];
+    if(level==="subjects") bits.push(`${g.topics.size} topic${g.topics.size===1?"":"s"}`);
+    else if(level==="flat") bits.push(g.subject);
+    if(kind==="ai"){
+      if(level!=="subjects"){
+        const t = (DATA.attempts||[]).filter(a=>a.type==="ai" && a.syllabus_id===cur && a.scopeKey===`ai:${g.subject}|||${g.topic}`).length;
+        if(t) bits.push(`📝 ${t} test${t===1?"":"s"}`);
+      }
+      const ds = diffSuffix(g.items.map(i=>i.q)); if(ds) bits.push(ds.replace(" · ",""));
+    } else {
+      bits.push(`${g.items.filter(i=>i.c.status==="known").length}/${n} known`);
+    }
+    return { subject:g.subject, topic:g.topic, n, title: level==="subjects" ? g.subject : g.topic, sub: bits.join(" · ") };
+  });
+}
+function hubBodyHtml(kind, screen, level, subject){
+  const term = getSearch().toLowerCase(), sort = screen.hubSort || "freq";
+  let rows = hubRows(kind, level, subject);
+  if(term) rows = rows.filter(r=> r.title.toLowerCase().includes(term) || r.subject.toLowerCase().includes(term));
+  if(sort==="az") rows.sort((a,b)=>a.title.localeCompare(b.title));
+  else rows.sort((a,b)=> b.n-a.n || a.title.localeCompare(b.title));
+  let html = `<input class="search" id="searchBox" placeholder="Search ${level==="subjects"?"subjects":"topics"}…" value="${escapeHtml(getSearch())}">`;
+  html += `<div class="segmented" id="hubSortSeg" style="margin-top:8px;"><button data-s="freq" class="${sort==="freq"?"active":""}">Frequency</button><button data-s="az" class="${sort==="az"?"active":""}">A–Z</button></div>`;
+  if(!rows.length){
+    html += emptyState(term ? "No matches" : "Nothing here yet", term ? "" : (kind==="ai" ? "Generate AI questions from a topic page, or from a study PDF." : "Make flashcards from a study PDF (open a topic → 📄 Study PDFs)."));
+  } else {
+    html += `<div id="listWrap">` + rows.map((r,i)=> rowHtml({ num:String(i+1).padStart(2,"0"), title:r.title, sub:r.sub, count:HUB_META[kind].unit(r.n),
+      dataAttr:`data-hub-subject="${escapeHtml(r.subject)}" data-hub-topic="${escapeHtml(r.topic||"")}"` })).join("") + `</div>`;
   }
   return html;
 }
-function bindAiHub(){
-  const allBtn = document.getElementById("aiHubAll");
-  if(allBtn) allBtn.addEventListener("click", ()=> pushScreen({ type:"ai-questions" }));
-  document.querySelectorAll("#listWrap .row[data-ai-subject]").forEach(r=> r.addEventListener("click", ()=> pushScreen({ type:"ai-questions", subject:r.dataset.aiSubject })));
+function bindHubBody(kind, screen, level, rerender){
+  document.querySelectorAll("#hubSortSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.hubSort = b.dataset.s; rerender(); }));
+  document.querySelectorAll("#listWrap .row[data-hub-subject]").forEach(r=> r.addEventListener("click", ()=>{
+    const subject = r.dataset.hubSubject, topic = r.dataset.hubTopic || null;
+    if(level==="subjects") pushScreen({ type:"hub-subject", kind, subject });
+    else pushScreen(kind==="ai" ? { type:"ai-questions", subject, topic } : { type:"flashcards", subject, topic });
+  }));
+  bindSearchInput(rerender);
+}
+function hubInnerHtml(kind, screen){
+  const view = screen.hubView || "subjects";
+  let html = `<div class="segmented" id="hubViewSeg" style="margin-bottom:8px;"><button data-v="subjects" class="${view==="subjects"?"active":""}">By subject</button><button data-v="flat" class="${view==="flat"?"active":""}">All topics</button></div>`;
+  html += `<div style="display:flex;gap:8px;margin-bottom:8px;"><button class="iconbtn" data-ai="pdf-hub" style="flex:1;justify-content:center;">📄 ${kind==="ai"?"AI questions":"Flashcards"} from a study PDF</button></div>`;
+  return html + hubBodyHtml(kind, screen, view, null);
+}
+function bindHubInner(kind, screen, rerender){
+  document.querySelectorAll("#hubViewSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.hubView = b.dataset.v; setSearch(""); rerender(); }));
+  bindHubBody(kind, screen, screen.hubView || "subjects", rerender);
+}
+function renderHubSubjects(){
+  const screen = currentScreen(), kind = screen.kind, M = HUB_META[kind];
+  let html = `<div class="detail-head"><div style="width:100%"><div class="backrow" id="backBtn">‹ ${escapeHtml(aiBackLabel())}</div>
+    <h2>${M.icon} ${M.title}</h2><div class="meta">${hubPool(kind).length} ${M.noun} · kept separate from PYQs</div></div></div>`;
+  mainEl.innerHTML = html + hubInnerHtml(kind, screen);
+  document.getElementById("backBtn").addEventListener("click", popScreen);
+  bindHubInner(kind, screen, renderHubSubjects);
+}
+function renderHubSubject(){
+  const screen = currentScreen(), kind = screen.kind, subject = screen.subject, M = HUB_META[kind];
+  const n = hubPool(kind).filter(x=>x.subject===subject).length;
+  let html = `<div class="detail-head"><div style="width:100%"><div class="backrow" id="backBtn">‹ ${escapeHtml(aiBackLabel())}</div>
+    <h2>${escapeHtml(subject)}</h2><div class="meta">${M.icon} ${n} ${M.noun}</div></div></div>`;
+  html += contentSwitchHtml(kind, subject, null);
+  html += `<div style="display:flex;gap:8px;margin:8px 0 4px;"><button class="iconbtn primary" id="hubViewAll" style="flex:1;justify-content:center;" ${n===0?"disabled":""}>View all ${n} in ${escapeHtml(subject)}</button></div>`;
+  html += listingNoteBlockHtml(screen);
+  html += hubBodyHtml(kind, screen, "topics", subject);
+  mainEl.innerHTML = html;
+  document.getElementById("backBtn").addEventListener("click", popScreen);
+  document.getElementById("hubViewAll").addEventListener("click", ()=> pushScreen(kind==="ai" ? { type:"ai-questions", subject } : { type:"flashcards", subject }));
+  bindHubBody(kind, screen, "topics", renderHubSubject);
+}
+
+/* ---- Flashcards viewer ---- */
+function shuffleArr(a){ const x = a.slice(); for(let i=x.length-1;i>0;i--){ const j = Math.floor(Math.random()*(i+1)); const t=x[i]; x[i]=x[j]; x[j]=t; } return x; }
+function renderFlashcards(){
+  const screen = currentScreen();
+  const subject = screen.subject || null, topic = screen.topic || null;
+  const all = visibleFlashcards().filter(c=> (!subject||c.subject===subject) && (!topic||(c.topic||FALLBACK_TOPIC)===topic));
+  const knownN = all.filter(c=>c.status==="known").length, learnN = all.length - knownN;
+  const filt = screen.fcFilter || "all", mode = screen.fcMode || "study";
+  const matches = c=> filt==="all" ? true : filt==="known" ? c.status==="known" : c.status!=="known";
+  const sig = [filt, subject||"", topic||"", all.length].join("|");
+  if(!screen.fcDeck || screen._fcSig!==sig){
+    const base = all.filter(matches);
+    screen.fcDeck = (screen.fcShuffle ? shuffleArr(base) : base).map(c=>c.id);
+    screen._fcSig = sig; screen.fcIndex = 0; screen.fcFlip = false;
+  }
+  const byId = {}; all.forEach(c=>byId[c.id]=c);
+  const deck = screen.fcDeck.map(id=>byId[id]).filter(Boolean);
+  if((screen.fcIndex||0) >= deck.length) screen.fcIndex = deck.length;      /* === deck.length means "finished" */
+  const idx = screen.fcIndex||0, flip = !!screen.fcFlip;
+  const title = topic || subject || "Flashcards";
+  let html = `<div class="detail-head"><div style="width:100%"><div class="backrow" id="backBtn">‹ ${escapeHtml(aiBackLabel())}</div>
+    <h2>${escapeHtml(title)}</h2><div class="meta">🃏 ${all.length} card${all.length===1?"":"s"} · ${knownN} known · ${learnN} to learn${subject&&topic?` · ${escapeHtml(subject)}`:""}</div></div></div>`;
+  if(subject) html += contentSwitchHtml("fc", subject, topic);
+  html += `<div class="segmented" id="fcModeSeg" style="margin:6px 0;"><button data-m="study" class="${mode==="study"?"active":""}">▶ Study</button><button data-m="list" class="${mode==="list"?"active":""}">📋 List</button></div>`;
+  html += `<div class="segmented" id="fcFilterSeg" style="margin:6px 0;"><button data-f="all" class="${filt==="all"?"active":""}">All (${all.length})</button><button data-f="learn" class="${filt==="learn"?"active":""}">To learn (${learnN})</button><button data-f="known" class="${filt==="known"?"active":""}">Known (${knownN})</button></div>`;
+  html += listingNoteBlockHtml(screen);
+  if(!all.length){
+    html += emptyState("No flashcards here yet", "Open a topic → 📄 Study PDFs → 🃏 Flashcards to make some from your notes.");
+  } else if(mode==="study"){
+    html += `<div style="display:flex;gap:8px;margin:8px 0;"><button class="iconbtn ${screen.fcShuffle?"good":""}" id="fcShuffleBtn" style="flex:1;justify-content:center;">🔀 Shuffle ${screen.fcShuffle?"on":"off"}</button><button class="iconbtn" id="fcRestartBtn" style="flex:1;justify-content:center;">↺ Restart</button></div>`;
+    if(!deck.length) html += emptyState("Nothing in this filter", "Try “All”.");
+    else if(idx>=deck.length){
+      html += `<div class="fc-card fc-done"><div class="fc-text">🎉 Round finished</div><div class="fc-hint">${knownN} known · ${learnN} still to learn</div></div>
+        <div style="display:flex;gap:8px;margin-top:10px;"><button class="iconbtn primary" id="fcAgainRound" style="flex:1;justify-content:center;">Study the “to learn” cards</button></div>`;
+    } else {
+      const c = deck[idx];
+      html += `<div class="fc-count">${idx+1} of ${deck.length}${c.status==="known"?" · ✔ known":c.status==="again"?" · ↺ again":""}</div>
+        <div class="fc-card ${flip?"flipped":""}" id="fcCard"><div class="fc-side">${flip?"Answer":"Question"}</div>
+          <div class="fc-text">${renderRichText(flip?c.back:c.front)}</div>
+          ${flip ? (c.source && c.source.pdf ? `<div class="fc-src">📄 ${escapeHtml(c.source.pdf)}${c.source.page?`, p.${c.source.page}`:""}</div>` : "") : `<div class="fc-hint">Tap the card to see the answer</div>`}
+        </div>`;
+      html += flip ? `<div style="display:flex;gap:10px;margin-top:10px;"><button class="iconbtn swipe-nav-btn" id="fcAgain" style="flex:1;justify-content:center;">↺ Again</button><button class="iconbtn primary swipe-nav-btn" id="fcKnow" style="flex:1;justify-content:center;">✔ Know it</button></div>`
+                   : `<div style="display:flex;gap:10px;margin-top:10px;"><button class="iconbtn swipe-nav-btn" id="fcPrev" style="flex:1;justify-content:center;" ${idx<=0?"disabled":""}>‹ Prev</button><button class="iconbtn swipe-nav-btn" id="fcSkip" style="flex:1;justify-content:center;">Skip ›</button></div>`;
+    }
+  } else {
+    html += all.filter(matches).map(c=>`<div class="ai-genq fc-row" data-cid="${escapeHtml(c.id)}">
+      <div class="meta">${c.status==="known"?"✔ known":c.status==="again"?"↺ again":"• new"}${c.subject&&!subject?` · ${escapeHtml(c.subject)}`:""}${!topic&&c.topic?` › ${escapeHtml(c.topic)}`:""}</div>
+      <div class="qtext"><b>Q:</b> ${renderRichText(c.front)}</div><div class="qtext"><b>A:</b> ${renderRichText(c.back)}</div>
+      ${c.source&&c.source.pdf?`<details><summary class="meta">Source</summary><div class="chart-note" style="white-space:pre-wrap;">📄 ${escapeHtml(c.source.pdf)}${c.source.page?`, p.${c.source.page}`:""}\n“${escapeHtml(c.source.quote||"")}”</div></details>`:""}
+      <div class="row-btns" style="margin-top:6px;"><button class="iconbtn" data-fc-set="known">✔ Known</button><button class="iconbtn" data-fc-set="again">↺ Again</button><button class="iconbtn bad" data-fc-del="1">🗑</button></div></div>`).join("") || emptyState("Nothing in this filter","");
+  }
+  mainEl.innerHTML = html;
+  const $ = id=>document.getElementById(id);
+  $("backBtn").addEventListener("click", popScreen);
+  document.querySelectorAll("#fcModeSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.fcMode = b.dataset.m; render(); }));
+  document.querySelectorAll("#fcFilterSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.fcFilter = b.dataset.f; render(); }));
+  const restart = ()=>{ screen.fcDeck = null; render(); };
+  if($("fcShuffleBtn")) $("fcShuffleBtn").addEventListener("click", ()=>{ screen.fcShuffle = !screen.fcShuffle; restart(); });
+  if($("fcRestartBtn")) $("fcRestartBtn").addEventListener("click", restart);
+  if($("fcAgainRound")) $("fcAgainRound").addEventListener("click", ()=>{ screen.fcFilter = "learn"; screen.fcDeck = null; render(); });
+  if($("fcCard")) $("fcCard").addEventListener("click", ()=>{ screen.fcFlip = !screen.fcFlip; render(); });
+  const advance = ()=>{ screen.fcIndex = (screen.fcIndex||0)+1; screen.fcFlip = false; render(); };
+  if($("fcKnow")) $("fcKnow").addEventListener("click", ()=>{ setCardStatus(deck[idx].id,"known"); advance(); });
+  if($("fcAgain")) $("fcAgain").addEventListener("click", ()=>{ setCardStatus(deck[idx].id,"again"); advance(); });
+  if($("fcSkip")) $("fcSkip").addEventListener("click", advance);
+  if($("fcPrev")) $("fcPrev").addEventListener("click", ()=>{ screen.fcIndex = Math.max(0,(screen.fcIndex||0)-1); screen.fcFlip = false; render(); });
+  document.querySelectorAll(".fc-row").forEach(row=>{
+    const id = row.dataset.cid;
+    row.querySelectorAll("[data-fc-set]").forEach(b=> b.addEventListener("click", ()=>{ setCardStatus(id, b.dataset.fcSet); render(); }));
+    const del = row.querySelector("[data-fc-del]");
+    if(del) del.addEventListener("click", ()=>{ if(confirm("Delete this flashcard?")){ deleteFlashcard(id); screen.fcDeck = null; render(); } });
+  });
 }
 
 function renderBankRoot(){
   const screen = currentScreen();
   const view = screen.bankView || "banks";
-  const seg = `<div class="segmented" id="bankViewSeg" style="margin-bottom:10px;"><button data-v="banks" class="${view==="banks"?"active":""}">📦 Banks</button><button data-v="ai" class="${view==="ai"?"active":""}">🤖 AI questions</button></div>`;
-  const bindSeg = ()=> document.querySelectorAll("#bankViewSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.bankView = b.dataset.v; render(); }));
-  if(view==="ai"){
-    mainEl.innerHTML = seg + renderAiHub();
-    bindSeg(); bindAiHub();
+  const seg = `<div class="segmented" id="bankViewSeg" style="margin-bottom:10px;"><button data-v="banks" class="${view==="banks"?"active":""}">📦 Banks</button><button data-v="ai" class="${view==="ai"?"active":""}">🤖 AI questions</button><button data-v="fc" class="${view==="fc"?"active":""}">🃏 Flashcards</button></div>`;
+  const bindSeg = ()=> document.querySelectorAll("#bankViewSeg button").forEach(b=> b.addEventListener("click", ()=>{ screen.bankView = b.dataset.v; setSearch(""); render(); }));
+  if(view==="ai" || view==="fc"){
+    mainEl.innerHTML = seg + hubInnerHtml(view, screen);
+    bindSeg(); bindHubInner(view, screen, render);
     return;
   }
   const banks = DATA.banks;
@@ -4879,6 +5049,7 @@ function openDataModal(){
         studyProgress: (pendingImportData.studyProgress && typeof pendingImportData.studyProgress==="object") ? pendingImportData.studyProgress : (DATA.studyProgress||{}),
         dailyActivity: (pendingImportData.dailyActivity && typeof pendingImportData.dailyActivity==="object") ? pendingImportData.dailyActivity : (DATA.dailyActivity||{}),
         listingNotes: (pendingImportData.listingNotes && typeof pendingImportData.listingNotes==="object") ? pendingImportData.listingNotes : (DATA.listingNotes||{}),
+        flashcards: Array.isArray(pendingImportData.flashcards) ? pendingImportData.flashcards : (DATA.flashcards||[]),
         statsResetAt: pendingImportData.statsResetAt || DATA.statsResetAt || 0
       };
     } else {
@@ -4896,7 +5067,8 @@ function openDataModal(){
       DATA = {
         papers: Object.values(byId), attempts, banks: DATA.banks||[], syllabuses: DATA.syllabuses, paperTemplates: DATA.paperTemplates||[],
         topicLists: DATA.topicLists||[], topicLabels: DATA.topicLabels||{}, studyProgress: DATA.studyProgress||{}, dailyActivity: DATA.dailyActivity||{},
-        listingNotes: Object.assign({}, DATA.listingNotes||{}, pendingImportData.listingNotes||{}), statsResetAt: DATA.statsResetAt||0
+        listingNotes: Object.assign({}, DATA.listingNotes||{}, pendingImportData.listingNotes||{}), statsResetAt: DATA.statsResetAt||0,
+        flashcards: (()=>{ const m = {}; (DATA.flashcards||[]).forEach(c=>m[c.id]=c); (Array.isArray(pendingImportData.flashcards)?pendingImportData.flashcards:[]).forEach(c=>m[c.id]=c); return Object.values(m); })()
       };
     }
     DATA = loadDataFromObject(DATA);
@@ -4914,6 +5086,8 @@ function loadDataFromObject(parsed){
   if(!Array.isArray(parsed.topicLists)) parsed.topicLists = [];
   if(!parsed.topicLabels || typeof parsed.topicLabels !== "object") parsed.topicLabels = {};
   if(!parsed.listingNotes || typeof parsed.listingNotes !== "object") parsed.listingNotes = {};
+  if(!Array.isArray(parsed.flashcards)) parsed.flashcards = [];
+  parsed.flashcards.forEach(c=>{ if(!c.syllabus_id) c.syllabus_id = "default"; });
   if(!parsed.studyProgress || typeof parsed.studyProgress !== "object") parsed.studyProgress = {};
   migrateStudyProgress(parsed.studyProgress);
   if(!parsed.dailyActivity || typeof parsed.dailyActivity !== "object") parsed.dailyActivity = {};

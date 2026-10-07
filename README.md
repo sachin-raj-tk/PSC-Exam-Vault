@@ -112,7 +112,7 @@ to have an AI generate it from a PDF.
 ## AI features (bring your own key)
 Tap **🤖** next to the syllabus button → add presets (OpenRouter, Gemini, Groq, OpenAI, Anthropic, DeepSeek, Mistral, or any OpenAI-compatible URL). Keys are stored only in this browser and are never included in backups. Order presets by priority; with auto-switch on, the app moves to the next preset when one hits its limit or fails.
 - **🤖 on a question / "Explain my mistake" in test review:** explain, mnemonic, revision note; save as explanation or note.
-- **🧩 Similar questions / topic page "AI practice questions":** generates MCQs, you review them, then they go into an "AI Practice Questions" paper.
+- **🧩 Similar questions / topic page "AI practice questions":** generates MCQs, you review them, then they go into the separate **AI questions** section.
 - **Stats → Overview → AI tools:** study plan from your weak, slow and guess-heavy topics; memory tricks for wrong answers.
 - **Stats → Guesswork → AI guess coach.**
 AI output can be wrong — verify facts before relying on it. Model names change; edit them in the preset.
@@ -125,3 +125,33 @@ AI output can be wrong — verify facts before relying on it. Model names change
 - **Exam picker:** search exams by name.
 - **Auto difficulty:** answered questions with no difficulty are marked Easy (<26s), Medium (26–50s) or Difficult (>50s); you can change it any time and it then stays as you set it. Paused/background time is never counted.
 - **Stats:** “Right/Wrong by level” tab; counting basis (first / latest / all attempts — default first attempt, each question counted once); small-sample adjustment and ⚠ low-data marks; delete a single test (Attempts); “Start fresh stats” keeps all other data.
+
+## Study PDFs → AI questions (aipdf.js)
+
+On any listing (topic, subject, exam, bank) tap **📄 Study PDFs → AI questions**.
+
+- **Add PDF** – text is read in the browser with pdf.js (loaded from cdnjs the first time, then cached for offline use). The PDF and its text are stored on the phone (IndexedDB) and are not part of backups.
+- **Scanned / old-font pages** are detected automatically. **Read scanned** sends each page image to a vision-capable AI preset (Gemini recommended, works for Malayalam) and stores the transcription. **Pages** lets you view, correct or re-read any page.
+- **Style guide** – learned from your own PYQs for the chosen subject/topic (editable, saved per topic). PYQs are used for format only, never for facts.
+- **Generate** – the PDF is split into sections; each section is sent separately with strict rules: facts only from the passage, a verbatim `source_quote` for every question.
+- **Checks in code** – the quote must be found in the PDF text (exact or ≥90 % close) or the question is dropped; options are shuffled; an optional second AI pass answers each question from the passage alone and flags disagreements.
+- **Review** – questions that failed a check are unticked; each shows its page and source line. Saved questions go to the separate AI questions section with the source in the explanation.
+
+Limits: needs internet for the AI calls; scanned-page reading is one AI call per page; AI-read text can contain small errors (check in Pages).
+
+## AI questions are kept separate from PYQs
+
+- **Where they live:** Bank tab → 🤖 AI questions (browse by subject), and a **📚 PYQs | 🤖 AI questions** switch on every subject page, subject "all questions" page and topic page. There is also a 🤖 AI questions button at the top of the Subjects and Topics tabs.
+- **Never mixed:** AI questions do not appear in Papers, Subjects/Topics counts and lists, global search, bank pickers, flagged list, wrong-answer queue, mock exams, weak-area banks, the study plan, or duplicate checks.
+- **Practice:** the AI questions screen has its own filters (subject, topic, flagged) and its own practice tests. Those tests are saved as AI tests (Attempts tab → 🤖 AI).
+- **Stats:** Stats tab → 📚 PYQ stats | 🤖 AI-question stats toggle. Each side uses only its own questions and attempts. The PYQ-only tools (quick practice, plan, review queue, guess coach) are hidden on the AI side.
+- **Existing AI questions** you made earlier move to the AI section automatically.
+
+## Flashcards, revision notes and the AI hubs
+
+- **Three content views per topic** – on any topic or subject page switch between **PYQs / 🤖 AI / 🃏 Cards**. They are always separate lists; AI questions and cards never appear among PYQs.
+- **Bank tab** has three views: 📦 Banks, 🤖 AI questions and 🃏 Flashcards. For AI questions and flashcards you first see the **subject list**, tap a subject to see its **topics** (by frequency or A–Z, with search and an "All topics" view), then tap a topic to see its questions or cards.
+- **Flashcards from a study PDF** – open a topic → 📄 Study PDFs → **🃏 Flashcards**. Pick subject, topic, page range, count and language. Every card carries the exact source line from your PDF (verified in code); cards whose numbers are not in the passage are flagged and left unticked. Study mode: tap to flip, mark ✓ Know / ↻ Again; list mode lets you filter and delete.
+- **Revision note from a PDF** – 📄 Study PDFs → **📝 Revision note** (short or detailed). Strictly bullet points from the PDF, bullets with numbers not found in the text are dropped. Edit, then **Save to topic note** (appends to the topic's 📝 My note) or Copy.
+- **Stats** – the 📚 PYQ / 🤖 AI toggle on the Stats tab switches every stats screen (overview, subjects, level, time, difficulty, guess, per-subject, all topics) between PYQ data and AI-question data; the two are never mixed.
+- Flashcards are included in the JSON backup/restore. PDFs are not.

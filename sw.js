@@ -1,4 +1,4 @@
-const CACHE_NAME = "psc-exam-vault-v9";
+const CACHE_NAME = "psc-exam-vault-v10";
 const ASSETS = [
   "./",
   "./index.html",
